@@ -91,7 +91,7 @@ import {
 } from "./pi-subagents.js";
 import { parsePiWorkflowSubagentId } from "./pi-subagent-workflow.js";
 import { readPiWorkflowChild } from "./pi-workflow-child-history.js";
-import { restorePiSubagents } from "./pi-subagent-history.js";
+import { piSubagentReceiptRuns, restorePiSubagents } from "./pi-subagent-history.js";
 import { rollbackPiLastTurn } from "./pi-last-turn-rollback.js";
 import { PiSessionImportIndex } from "./pi-session-import.js";
 import { SessionImportScope } from "@codexhost/harness-adapter/session-import";
@@ -430,7 +430,7 @@ class PiHarnessSession implements HarnessSession {
   readonly initialUsage: HostUsage | null;
   readonly outputs: AsyncIterable<HarnessOutput>;
   readonly #channel = new HarnessOutputChannel<HarnessOutput>();
-  readonly #subagents = new PiSubagents((event) => this.#event(event));
+  readonly #subagents = new PiSubagents((event) => this.#event(event), piSubagentReceiptRuns);
   #pendingSubagentStatus: PiSubagentNode[] | null = null;
   readonly #closeTimeoutMs: number;
   readonly #createTransport: PiAdapterDependencies["createTransport"];
@@ -555,7 +555,12 @@ class PiHarnessSession implements HarnessSession {
     try {
       const transport = await this.#ensureTransport();
       const history = await transport.getEntries();
-      await restorePiSubagents(history, transport.state.sessionId, this.#subagents);
+      const owners = [transport.state.sessionId, transport.state.sessionFile];
+      await restorePiSubagents(
+        history,
+        new Set(owners.filter((owner): owner is string => Boolean(owner))),
+        this.#subagents,
+      );
       return {
         ok: true,
         value: {
