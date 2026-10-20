@@ -119,6 +119,19 @@ function itemId(entryId: string, kind: string, ordinal: number) {
   return hostItemIdSchema.parse(`pi-item-v1-${entryId}-${kind}-${ordinal}`);
 }
 
+/**
+ * An abort that lands before the provider stream starts is saved as an error carrying the
+ * AbortError message; it is still a cancellation.
+ */
+export function isPiAbortStop(final: Record<string, unknown>): boolean {
+  return (
+    final.stopReason === "aborted" ||
+    (final.stopReason === "error" &&
+      (final.errorMessage === "This operation was aborted" ||
+        final.errorMessage === "Request was aborted"))
+  );
+}
+
 function assistantOutcome(entries: PiEntry[]): HistoricalTurnOutcome {
   const assistants = entries
     .map((entry) => message(entry))
@@ -126,7 +139,7 @@ function assistantOutcome(entries: PiEntry[]): HistoricalTurnOutcome {
   const final = assistants.at(-1);
   if (!final) return { status: "unknown", reason: "Pi history has no Assistant terminal" };
   const stopReason = final.stopReason;
-  if (stopReason === "aborted") {
+  if (isPiAbortStop(final)) {
     return { status: "cancelled", reason: "Pi Assistant was aborted" };
   }
   if (stopReason === "error") {

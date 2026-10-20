@@ -10,6 +10,7 @@ import {
   PiRpcSession,
   piRpcProcessCommand,
   type PiAutonomousTurn,
+  type PiAutonomousTurnCompletion,
   type PiRpcProcessAdapter,
   type PiRpcProcessOptions,
   type PiTurnEvent,
@@ -101,6 +102,7 @@ class FakePiRpcProcess extends EventEmitter {
       stopReason?: "stop" | "aborted" | "error";
       includeTool?: boolean;
       streamingAtSettle?: boolean;
+      errorMessage?: string;
     } = {},
   ): void {
     const responseId =
@@ -110,7 +112,9 @@ class FakePiRpcProcess extends EventEmitter {
       role: "assistant",
       ...(responseId ? { responseId } : {}),
       stopReason,
-      ...(stopReason === "error" ? { errorMessage: "autonomous failure" } : {}),
+      ...(stopReason === "error"
+        ? { errorMessage: options.errorMessage ?? "autonomous failure" }
+        : {}),
       content: [
         { type: "thinking", thinking: "autonomous reasoning" },
         { type: "text", text: "autonomous text" },
@@ -919,6 +923,28 @@ function autonomousSession(onFault = vi.fn()): {
   };
 }
 
+interface AutonomousRecord {
+  turn: PiAutonomousTurn;
+  events: PiTurnEvent[];
+  result?: PiAutonomousTurnCompletion;
+}
+
+/** Registers a handler that attaches immediately (an idle Host) and records every completion. */
+function recordAutonomous(rpc: PiRpcSession): AutonomousRecord[] {
+  const records: AutonomousRecord[] = [];
+  rpc.setAutonomousTurnHandler((turn) => {
+    const record: AutonomousRecord = { turn, events: [] };
+    records.push(record);
+    turn.attach((event) => record.events.push(event));
+    return {
+      complete(result) {
+        record.result = result;
+      },
+    };
+  });
+  return records;
+}
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (!predicate()) {
@@ -984,7 +1010,7 @@ describe("Pi RPC Turn aggregation", () => {
     const { rpc, process: fakeProcess } = autonomousSession();
     const observations: PiUsageObservation[] = [];
     rpc.setUsageHandler((observation) => observations.push(observation));
-    rpc.setAutonomousTurnHandler(() => undefined);
+    rpc.setAutonomousTurnHandler(() => null);
     await rpc.start();
     try {
       fakeProcess().emitAutonomousTurn({ includeTool: true });
@@ -1007,7 +1033,7 @@ describe("Pi RPC Turn aggregation", () => {
     const { rpc, process: fakeProcess } = autonomousSession();
     const observations: PiUsageObservation[] = [];
     rpc.setUsageHandler((observation) => observations.push(observation));
-    rpc.setAutonomousTurnHandler(() => undefined);
+    rpc.setAutonomousTurnHandler(() => null);
     await rpc.start();
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
     try {
@@ -1032,19 +1058,17 @@ describe("Pi RPC Turn aggregation", () => {
     }
   });
 
-  it("aggregates an idle autonomous Assistant/Tool Turn once with response identity", async () => {
+  it("streams an idle autonomous Assistant/Tool Turn live and completes it once with response identity", async () => {
     const { rpc, process: fakeProcess, onFault } = autonomousSession();
-    const turns: PiAutonomousTurn[] = [];
-    rpc.setAutonomousTurnHandler((turn) => turns.push(turn));
+    const turns = recordAutonomous(rpc);
     await rpc.start();
 
     fakeProcess().emitAutonomousTurn({ includeTool: true });
-    await waitFor(() => turns.length === 1);
+    await waitFor(() => turns[0]?.result !== undefined);
 
-    expect(turns[0]).toMatchObject({
-      nativeTurnKey: "autonomous-response",
-      result: { status: "succeeded", text: "autonomous text" },
-    });
+    expect(turns[0]?.turn.nativeTurnKey).toBe("autonomous-response");
+    expect(turns[0]?.result).toMatchObject({ status: "succeeded", text: "autonomous text" });
+    expect(turns[0]?.result?.history?.entries).toHaveLength(1);
     expect(turns[0]?.events.map(({ type }) => type)).toEqual([
       "reasoning.delta",
       "text.delta",
@@ -1061,22 +1085,60 @@ describe("Pi RPC Turn aggregation", () => {
     await rpc.close();
   });
 
+  it("announces an autonomous Turn at its start and replays buffered events on attach", async () => {
+    const { rpc, process: fakeProcess, onFault } = autonomousSession();
+    const announced: PiAutonomousTurn[] = [];
+    const live: PiTurnEvent[] = [];
+    const completions: PiAutonomousTurnCompletion[] = [];
+    rpc.setAutonomousTurnHandler((turn) => {
+      announced.push(turn);
+      return { complete: (result) => completions.push(result) };
+    });
+    await rpc.start();
+
+    fakeProcess().emitAutonomousStart();
+    await waitFor(() => announced.length === 1);
+    expect(completions).toHaveLength(0);
+
+    announced[0]?.attach((event) => live.push(event));
+    expect(live.map(({ type }) => type)).toEqual(["text.delta"]);
+
+    fakeProcess().emitAgentSettled();
+    await waitFor(() => completions.length === 1);
+    expect(completions[0]).toMatchObject({ status: "succeeded", text: "partial" });
+    expect(onFault).not.toHaveBeenCalled();
+    await rpc.close();
+  });
+
   it("generates one stable autonomous key without responseId and classifies native abort", async () => {
     const { rpc, process: fakeProcess } = autonomousSession();
-    const turns: PiAutonomousTurn[] = [];
-    rpc.setAutonomousTurnHandler((turn) => turns.push(turn));
+    const turns = recordAutonomous(rpc);
     await rpc.start();
 
     fakeProcess().emitAutonomousTurn({ responseId: null, stopReason: "aborted" });
-    await waitFor(() => turns.length === 1);
+    await waitFor(() => turns[0]?.result !== undefined);
 
-    expect(turns[0]?.nativeTurnKey).toMatch(/^[0-9a-f-]{36}$/);
-    expect(turns[0]?.result).toEqual({
+    expect(turns[0]?.turn.nativeTurnKey).toMatch(/^[0-9a-f-]{36}$/);
+    expect(turns[0]?.result).toMatchObject({
       status: "cancelled",
       text: "autonomous text",
       reason: "Pi autonomous Assistant was aborted",
     });
     await rpc.close();
+  });
+
+  it("classifies the native aborted error messages as cancellation", async () => {
+    for (const errorMessage of ["This operation was aborted", "Request was aborted"]) {
+      const { rpc, process: fakeProcess } = autonomousSession();
+      const turns = recordAutonomous(rpc);
+      await rpc.start();
+
+      fakeProcess().emitAutonomousTurn({ stopReason: "error", errorMessage });
+      await waitFor(() => turns[0]?.result !== undefined);
+
+      expect(turns[0]?.result).toMatchObject({ status: "cancelled" });
+      await rpc.close();
+    }
   });
 
   it("never misclassifies a requested Turn as autonomous", async () => {
@@ -1085,7 +1147,7 @@ describe("Pi RPC Turn aggregation", () => {
     rpc.setAutonomousTurnHandler(autonomous);
     await rpc.start();
 
-    await expect(rpc.runTurn("requested", () => undefined)).resolves.toEqual({
+    await expect(rpc.runTurn("requested", () => undefined)).resolves.toMatchObject({
       text: "synthetic final text",
       cancelled: false,
     });
@@ -1093,45 +1155,64 @@ describe("Pi RPC Turn aggregation", () => {
     await rpc.close();
   });
 
-  it("fails closed for autonomous blocking UI and streaming disagreement", async () => {
+  it("turns autonomous blocking UI into a Question and cancels blocking UI without any Turn", async () => {
     const blocking = autonomousSession();
-    const blockedTurns: PiAutonomousTurn[] = [];
-    blocking.rpc.setAutonomousTurnHandler((turn) => blockedTurns.push(turn));
+    const records = recordAutonomous(blocking.rpc);
     await blocking.rpc.start();
     blocking.process().emitAutonomousStart();
     blocking.process().emitBlockingInteraction();
-    await waitFor(() => blockedTurns.length === 1);
-    expect(blockedTurns[0]?.result).toMatchObject({
-      status: "failed",
-      error: { message: expect.stringContaining("blocking Extension UI") },
-    });
-    expect(blocking.onFault).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "protocolError" }),
+    await waitFor(
+      () => records[0]?.events.some(({ type }) => type === "interaction.requested") === true,
     );
+    expect(blocking.onFault).not.toHaveBeenCalled();
+    await blocking.rpc.respondToInteraction({ requestId: "autonomous-question", value: "yes" });
+    blocking.process().emitAgentSettled();
+    await waitFor(() => records[0]?.result !== undefined);
+    expect(records[0]?.result).toMatchObject({ status: "succeeded" });
     await blocking.rpc.close();
 
+    const idle = autonomousSession();
+    const responses: unknown[] = [];
+    await idle.rpc.start();
+    idle.process().stdin.on("data", (chunk: Buffer) => {
+      for (const line of chunk.toString("utf8").split("\n")) {
+        if (line.includes("extension_ui_response")) responses.push(JSON.parse(line));
+      }
+    });
+    idle.process().emitBlockingInteraction();
+    await waitFor(() => responses.length === 1);
+    expect(responses[0]).toMatchObject({
+      type: "extension_ui_response",
+      id: "autonomous-question",
+      cancelled: true,
+    });
+    expect(idle.onFault).not.toHaveBeenCalled();
+    await idle.rpc.close();
+  });
+
+  it("continues the same autonomous Turn when get_state is still Streaming after agent_settled", async () => {
     const streaming = autonomousSession();
-    const streamingTurns: PiAutonomousTurn[] = [];
-    streaming.rpc.setAutonomousTurnHandler((turn) => streamingTurns.push(turn));
+    const turns = recordAutonomous(streaming.rpc);
     await streaming.rpc.start();
     streaming.process().emitAutonomousTurn({ streamingAtSettle: true });
-    await waitFor(() => streamingTurns.length === 1);
-    expect(streamingTurns[0]?.result).toMatchObject({
-      status: "failed",
-      error: { message: expect.stringContaining("still Streaming") },
-    });
-    expect(streaming.onFault).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "protocolError" }),
-    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.result).toBeUndefined();
+    expect(streaming.onFault).not.toHaveBeenCalled();
+
+    streaming.process().emitAgentSettled();
+    await waitFor(() => turns[0]?.result !== undefined);
+    expect(turns[0]?.result).toMatchObject({ status: "succeeded", text: "autonomous text" });
+    expect(streaming.onFault).not.toHaveBeenCalled();
     await streaming.rpc.close();
   });
 
   it("reports an unfinished autonomous Turn as failed on close", async () => {
     const { rpc, process: fakeProcess } = autonomousSession();
-    const turns: PiAutonomousTurn[] = [];
-    rpc.setAutonomousTurnHandler((turn) => turns.push(turn));
+    const turns = recordAutonomous(rpc);
     await rpc.start();
     fakeProcess().emitAutonomousStart();
+    await waitFor(() => turns.length === 1);
 
     await rpc.close();
 
@@ -1329,7 +1410,7 @@ describe("Pi RPC Turn aggregation", () => {
     const events: PiTurnEvent[] = [];
     await rpc.start();
 
-    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toEqual({
+    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toMatchObject({
       text: "synthetic final text",
       cancelled: false,
     });
@@ -1346,7 +1427,7 @@ describe("Pi RPC Turn aggregation", () => {
     const events: PiTurnEvent[] = [];
     await rpc.start();
 
-    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toEqual({
+    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toMatchObject({
       text: "streamed answer",
       cancelled: false,
     });
@@ -1370,7 +1451,7 @@ describe("Pi RPC Turn aggregation", () => {
     const events: PiTurnEvent[] = [];
     await rpc.start();
 
-    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toEqual({
+    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toMatchObject({
       text: "reasoned answer",
       cancelled: false,
     });
@@ -1381,15 +1462,24 @@ describe("Pi RPC Turn aggregation", () => {
     await rpc.close();
   });
 
-  it("faults when agent_settled does not agree with the native Streaming state", async () => {
+  it("keeps a requested Turn open while agent_settled disagrees with the native Streaming state", async () => {
     const onFault = vi.fn();
-    const rpc = session("settled-streaming", onFault);
+    const child = new FakePiRpcProcess("settled-streaming");
+    const rpc = new PiRpcSession(
+      { cwd: process.cwd(), commandTimeoutMs: 2_000, closeTimeoutMs: 500, onFault },
+      { spawn: () => child as unknown as ChildProcessWithoutNullStreams },
+    );
     await rpc.start();
 
-    await expect(rpc.runTurn("synthetic", () => undefined)).rejects.toThrow(
-      "agent_settled state is still Streaming",
-    );
-    expect(onFault).toHaveBeenCalledWith(expect.objectContaining({ kind: "protocolError" }));
+    let settled = false;
+    const turn = rpc.runTurn("synthetic", () => undefined).finally(() => (settled = true));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(settled).toBe(false);
+    expect(onFault).not.toHaveBeenCalled();
+
+    child.emitAgentSettled();
+    await expect(turn).resolves.toMatchObject({ cancelled: false });
+    expect(onFault).not.toHaveBeenCalled();
     await rpc.close();
   });
 
@@ -1439,7 +1529,7 @@ describe("Pi RPC Turn aggregation", () => {
 
         await vi.advanceTimersByTimeAsync(1);
 
-        await expect(result).resolves.toEqual(
+        await expect(result).resolves.toMatchObject(
           scenario === "manual-compaction"
             ? { outcome: "succeeded" }
             : { text: "continued after compaction", cancelled: false },
@@ -1449,7 +1539,7 @@ describe("Pi RPC Turn aggregation", () => {
           { type: "compaction.completed", outcome: "succeeded" },
         ]);
         expect(onFault).not.toHaveBeenCalled();
-        await expect(rpc.runTurn("next turn", () => undefined)).resolves.toEqual({
+        await expect(rpc.runTurn("next turn", () => undefined)).resolves.toMatchObject({
           text: "synthetic final text",
           cancelled: false,
         });
@@ -1508,7 +1598,7 @@ describe("Pi RPC Turn aggregation", () => {
       await rpc.start();
       const result = expect(
         rpc.runTurn("continue", (event) => events.push(event)),
-      ).resolves.toEqual({
+      ).resolves.toMatchObject({
         text: "continued after compaction",
         cancelled: false,
       });
@@ -1573,7 +1663,7 @@ describe("Pi RPC Turn aggregation", () => {
     const events: PiTurnEvent[] = [];
     await rpc.start();
 
-    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toEqual({
+    await expect(rpc.runTurn("synthetic", (event) => events.push(event))).resolves.toMatchObject({
       text: "recovered",
       cancelled: false,
     });
@@ -1759,10 +1849,10 @@ describe("Pi RPC Turn aggregation", () => {
     const turn = rpc.runTurn("cancel me", (event) => events.push(event));
     await waitFor(() => events.some(({ type }) => type === "tool.started"));
     await expect(Promise.all([rpc.abort(), rpc.abort()])).resolves.toEqual([undefined, undefined]);
-    await expect(turn).resolves.toEqual({ text: "", cancelled: true });
+    await expect(turn).resolves.toMatchObject({ text: "", cancelled: true });
     expect(events.at(-1)).toMatchObject({ type: "tool.completed", isError: true });
 
-    await expect(rpc.runTurn("continue", (event) => events.push(event))).resolves.toEqual({
+    await expect(rpc.runTurn("continue", (event) => events.push(event))).resolves.toMatchObject({
       text: "continued",
       cancelled: false,
     });
@@ -1796,10 +1886,10 @@ describe("Pi RPC Turn aggregation", () => {
 
       await vi.advanceTimersByTimeAsync(1_200);
       await expect(aborting).resolves.toBeUndefined();
-      await expect(turn).resolves.toEqual({ text: "", cancelled: true });
+      await expect(turn).resolves.toMatchObject({ text: "", cancelled: true });
       expect(onFault).not.toHaveBeenCalled();
 
-      await expect(rpc.runTurn("continue", (event) => events.push(event))).resolves.toEqual({
+      await expect(rpc.runTurn("continue", (event) => events.push(event))).resolves.toMatchObject({
         text: "continued",
         cancelled: false,
       });
@@ -1838,6 +1928,20 @@ describe("Pi RPC Turn aggregation", () => {
     }
   });
 
+  it("completes a handled Prompt without run activity after confirming get_state is idle", async () => {
+    const onFault = vi.fn();
+    const rpc = session("fast", onFault);
+    await rpc.start();
+    const events: PiTurnEvent[] = [];
+
+    await expect(
+      rpc.runTurn("/codexhost-fast-mode off handled-nonce", (event) => events.push(event)),
+    ).resolves.toMatchObject({ text: "", cancelled: false });
+    expect(events).toEqual([]);
+    expect(onFault).not.toHaveBeenCalled();
+    await rpc.close();
+  });
+
   it("round-trips an Interaction that arrives before the Prompt response", async () => {
     const rpc = session("interaction");
     const events: PiTurnEvent[] = [];
@@ -1856,7 +1960,7 @@ describe("Pi RPC Turn aggregation", () => {
     await expect(
       rpc.respondToInteraction({ requestId: "native-question", value: "continue" }),
     ).resolves.toBeUndefined();
-    await expect(turn).resolves.toEqual({ text: "answered", cancelled: false });
+    await expect(turn).resolves.toMatchObject({ text: "answered", cancelled: false });
     expect(events.map(({ type }) => type)).toEqual([
       "interaction.requested",
       "interaction.closed",
@@ -1879,7 +1983,7 @@ describe("Pi RPC Turn aggregation", () => {
     await expect(
       rpc.respondToInteraction({ requestId: "native-question", value: "late" }),
     ).rejects.toThrow("not pending");
-    await expect(turn).resolves.toEqual({ text: "answered", cancelled: false });
+    await expect(turn).resolves.toMatchObject({ text: "answered", cancelled: false });
     expect(
       events.filter(
         (event) => event.type === "interaction.closed" && event.requestId === "native-question",
@@ -1896,7 +2000,7 @@ describe("Pi RPC Turn aggregation", () => {
     const turn = rpc.runTurn("cancel question", (event) => events.push(event));
     await waitFor(() => events.some(({ type }) => type === "interaction.requested"));
     await rpc.abort();
-    await expect(turn).resolves.toEqual({ text: "", cancelled: true });
+    await expect(turn).resolves.toMatchObject({ text: "", cancelled: true });
     expect(events.at(-1)).toMatchObject({
       type: "interaction.closed",
       reason: "cancelled",
@@ -1928,7 +2032,7 @@ describe("Pi RPC Turn aggregation", () => {
 
       await vi.advanceTimersByTimeAsync(180_001);
 
-      await expect(turn).resolves.toEqual({ text: "long turn complete", cancelled: false });
+      await expect(turn).resolves.toMatchObject({ text: "long turn complete", cancelled: false });
       expect(events.map(({ type }) => type)).toEqual([
         "tool.started",
         "tool.completed",
@@ -1936,7 +2040,7 @@ describe("Pi RPC Turn aggregation", () => {
         "message.completed",
       ]);
       expect(onFault).not.toHaveBeenCalled();
-      await expect(rpc.runTurn("continue", () => undefined)).resolves.toEqual({
+      await expect(rpc.runTurn("continue", () => undefined)).resolves.toMatchObject({
         text: "continued",
         cancelled: false,
       });

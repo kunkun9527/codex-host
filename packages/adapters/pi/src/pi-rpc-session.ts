@@ -15,7 +15,7 @@ import { parsePiNativeCommands, type PiNativeCommand } from "./pi-slash-commands
 import { ensurePiFastExtension, PI_FAST_ACK, PI_FAST_COMMAND } from "./pi-fast-mode.js";
 import type { PiEmptySessionConfiguration } from "./pi-empty-session.js";
 import { resolvePiExecutable, withNodeRuntimeOnPath } from "./command.js";
-import type { PiSessionHistory } from "./pi-history.js";
+import { isPiAbortStop, type PiSessionHistory } from "./pi-history.js";
 import {
   latestPiCacheHitRatePercent,
   optionalPiCacheHitRatePercent,
@@ -104,6 +104,8 @@ export type PiTurnEvent =
 export interface PiTurnResult {
   text: string;
   cancelled: boolean;
+  /** History snapshot taken while this Turn still owned the transport, once it was stable. */
+  history?: PiSessionHistory;
 }
 
 export type PiAutonomousTurnResult =
@@ -111,10 +113,18 @@ export type PiAutonomousTurnResult =
   | { status: "cancelled"; text: string; reason: string }
   | { status: "failed"; text: string; error: Error };
 
+export type PiAutonomousTurnCompletion = PiAutonomousTurnResult & { history?: PiSessionHistory };
+
+export interface PiAutonomousTurnHost {
+  complete(result: PiAutonomousTurnCompletion): void;
+}
+
+/** Announced when an autonomous Turn starts; `attach` replays buffered events, then goes live. */
 export interface PiAutonomousTurn {
   nativeTurnKey: string;
-  events: PiTurnEvent[];
-  result: PiAutonomousTurnResult;
+  /** History at the last idle read before the run started; null when none was read. */
+  beforeHistory: PiSessionHistory | null;
+  attach(sink: (event: PiTurnEvent) => void): void;
 }
 
 export interface PiCompactResult {
@@ -186,6 +196,15 @@ interface ManualCompaction {
 }
 
 interface ActiveTurn {
+  /** Counts run starts (agent, turn, tool, assistant message) so settling can detect new work. */
+  activity: number;
+  /** Counts agent_settled events. */
+  settleSignals: number;
+  disposition?: unknown;
+  live: ((event: PiTurnEvent) => void) | null;
+  host: PiAutonomousTurnHost | null;
+  beforeHistory: PiSessionHistory | null;
+  history: PiSessionHistory | null;
   origin: "requested" | "autonomous";
   autonomousEvents: PiTurnEvent[] | null;
   nativeTurnKey: string | null;
@@ -494,7 +513,9 @@ export class PiRpcSession {
     PiRpcSessionOptions;
   readonly #processAdapter: PiRpcProcessAdapter;
   #activeTurn: ActiveTurn | null = null;
-  #autonomousTurnHandler: ((turn: PiAutonomousTurn) => void) | null = null;
+  #autonomousTurnHandler: ((turn: PiAutonomousTurn) => PiAutonomousTurnHost | null) | null = null;
+  /** History at the last settle; tells which Pi turns a following autonomous run created. */
+  #lastSettledHistory: PiSessionHistory | null = null;
   #usageHandler: ((observation: PiUsageObservation) => void) | null = null;
   #usageRequestStartedAtMs: number | null = null;
   #buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -597,8 +618,13 @@ export class PiRpcSession {
     }
   }
 
-  setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => void): void {
+  setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => PiAutonomousTurnHost | null): void {
     this.#autonomousTurnHandler = handler;
+  }
+
+  /** Lets the Host refuse new work while an unattached autonomous Turn runs. */
+  get hasActiveTurn(): boolean {
+    return this.#activeTurn !== null;
   }
 
   async start(): Promise<this> {
@@ -683,7 +709,10 @@ export class PiRpcSession {
 
   async getEntries(): Promise<PiSessionHistory> {
     try {
-      return parseSessionHistory(await this.#send("get_entries", {}));
+      const entries = parseSessionHistory(await this.#send("get_entries", {}));
+      // Read while idle, so it predates any autonomous run that starts next.
+      if (!this.#activeTurn) this.#lastSettledHistory = entries;
+      return entries;
     } catch (error) {
       if (error instanceof PiRpcFaultError) this.#fail(error);
       throw error;
@@ -871,8 +900,15 @@ export class PiRpcSession {
     if (this.#activeTurn) throw new Error("Pi RPC Session already has an active Turn");
     if (text.length === 0) throw new Error("Pi text Turn must not be empty");
 
+    let requested!: ActiveTurn;
     const settled = new Promise<PiTurnResult>((resolve, reject) => {
-      this.#activeTurn = {
+      requested = this.#activeTurn = {
+        activity: 0,
+        settleSignals: 0,
+        live: null,
+        host: null,
+        beforeHistory: null,
+        history: null,
         origin: "requested",
         autonomousEvents: null,
         nativeTurnKey: null,
@@ -898,11 +934,46 @@ export class PiRpcSession {
       };
     });
     try {
-      await this.#send("prompt", { message: text });
+      const response = await this.#send("prompt", { message: text });
+      requested.disposition = isRecord(response.data) ? response.data.disposition : undefined;
+      if (requested.disposition === "handled") void this.#confirmHandledPrompt(requested);
     } catch (error) {
       this.#rejectActiveTurn(error instanceof Error ? error : new Error(message(error)));
     }
     return settled;
+  }
+
+  /** A prompt consumed by an extension command or input handler never settles. */
+  async #confirmHandledPrompt(active: ActiveTurn): Promise<void> {
+    const activity = active.activity;
+    if (activity > 0) return;
+    try {
+      const response = await this.#send("get_state", {});
+      if (
+        this.#activeTurn !== active ||
+        active.activity !== activity ||
+        active.settlement !== "pending" ||
+        parseSessionStreaming(response)
+      ) {
+        return;
+      }
+      this.#state = parseSessionState(response);
+      if (active.cancellationTimeout) clearTimeout(active.cancellationTimeout);
+      active.cancellationTimeout = null;
+      this.#closeInteractions(active, "superseded");
+      this.#activeTurn = null;
+      active.resolve({ text: active.text, cancelled: active.cancellation !== "none" });
+    } catch (error) {
+      if (this.#activeTurn !== active) return;
+      this.#fail(
+        error instanceof PiRpcFaultError
+          ? error
+          : new PiRpcFaultError(
+              "protocolError",
+              `Pi RPC handled prompt state could not be confirmed: ${message(error)}`,
+            ),
+      );
+    }
   }
 
   respondToInteraction(response: PiInteractionResponse): Promise<void> {
@@ -934,6 +1005,7 @@ export class PiRpcSession {
       throw new Error("Pi RPC interaction is not pending");
     }
     if (pending.timeout) clearTimeout(pending.timeout);
+    this.#resumePromptTimeouts();
     active.onEvent({ type: "interaction.closed", requestId: response.requestId, reason });
     try {
       await this.#write(frame);
@@ -960,6 +1032,12 @@ export class PiRpcSession {
     }
     if (active.abortPromise) return active.abortPromise;
     active.cancellation = "requesting";
+    // Pi's abort does not release extension dialogs; dismiss them so the run can stop.
+    for (const requestId of [...active.interactions.keys()]) {
+      void this.#resolveInteraction({ requestId, cancelled: true }, "cancelled").catch(
+        () => undefined,
+      );
+    }
     active.cancellationTimeout = setTimeout(() => {
       this.#terminateFailedCancellation(
         active,
@@ -1114,32 +1192,35 @@ export class PiRpcSession {
       !this.#manualCompaction &&
       !this.#compactionActive &&
       this.#autonomousTurnHandler &&
-      value.type === "message_start" &&
-      assistantText(value.message) !== null
+      (value.type === "agent_start" ||
+        (value.type === "message_start" && assistantText(value.message) !== null))
     ) {
       active = this.#startAutonomousTurn(value.message);
     }
     if (!active) {
-      if (value.type === "extension_ui_request" && this.#isBlockingInteraction(value)) {
-        this.#fail(
-          new PiRpcFaultError(
-            "protocolError",
-            "Pi RPC requested blocking Extension UI outside an active Turn",
-          ),
-        );
+      if (
+        value.type === "extension_ui_request" &&
+        this.#isBlockingInteraction(value) &&
+        typeof value.id === "string"
+      ) {
+        // No Turn can host this dialog; answer it as dismissed instead of faulting.
+        void this.#write({
+          type: "extension_ui_response",
+          id: value.id,
+          cancelled: true,
+        }).catch(() => undefined);
       }
       return;
     }
+    if (
+      value.type === "agent_start" ||
+      value.type === "turn_start" ||
+      value.type === "tool_execution_start" ||
+      (value.type === "message_start" && assistantText(value.message) !== null)
+    ) {
+      active.activity += 1;
+    }
     if (value.type === "extension_ui_request") {
-      if (active.origin === "autonomous" && this.#isBlockingInteraction(value)) {
-        this.#fail(
-          new PiRpcFaultError(
-            "protocolError",
-            "Pi RPC requested blocking Extension UI during an autonomous Turn",
-          ),
-        );
-        return;
-      }
       this.#startInteraction(active, value);
       return;
     }
@@ -1214,6 +1295,7 @@ export class PiRpcSession {
       return;
     }
     if (value.type === "agent_settled") {
+      active.settleSignals += 1;
       if (active.settlement !== "pending") return;
       active.settlement = "confirming";
       void this.#confirmSettledTurn(active);
@@ -1223,9 +1305,15 @@ export class PiRpcSession {
   #startAutonomousTurn(value: unknown): ActiveTurn {
     const events: PiTurnEvent[] = [];
     const active: ActiveTurn = {
+      activity: 0,
+      settleSignals: 0,
+      live: null,
+      host: null,
       origin: "autonomous",
       autonomousEvents: events,
       nativeTurnKey: assistantMessageId(value) ?? randomUUID(),
+      beforeHistory: this.#lastSettledHistory,
+      history: null,
       nativeCancellationObserved: false,
       text: "",
       assistantMessageId: null,
@@ -1234,7 +1322,7 @@ export class PiRpcSession {
       lastFinalizedMessageText: null,
       lastFinalizedMessageReasoning: null,
       reasoningMessageOpen: false,
-      onEvent: (event) => events.push(event),
+      onEvent: (event) => (active.live ? active.live(event) : events.push(event)),
       resolve: () => undefined,
       reject: () => undefined,
       failure: null,
@@ -1247,25 +1335,35 @@ export class PiRpcSession {
       abortPromise: null,
     };
     this.#activeTurn = active;
+    // Announce the autonomous Turn now; the Host attaches a live sink when it is free.
+    try {
+      active.host =
+        this.#autonomousTurnHandler?.({
+          nativeTurnKey: active.nativeTurnKey as string,
+          beforeHistory: active.beforeHistory,
+          attach: (sink) => {
+            if (active.live) return;
+            active.live = sink;
+            for (const event of events.splice(0)) sink(event);
+          },
+        }) ?? null;
+    } catch (error) {
+      this.#fail(
+        new PiRpcFaultError(
+          "protocolError",
+          `Pi autonomous Turn handler failed: ${message(error)}`,
+        ),
+      );
+    }
     return active;
   }
 
   #emitAutonomousTurn(active: ActiveTurn, result: PiAutonomousTurnResult): void {
-    const handler = this.#autonomousTurnHandler;
-    if (
-      active.origin !== "autonomous" ||
-      !active.nativeTurnKey ||
-      !active.autonomousEvents ||
-      !handler
-    ) {
+    if (active.origin !== "autonomous" || !active.host) {
       return;
     }
     try {
-      handler({
-        nativeTurnKey: active.nativeTurnKey,
-        events: [...active.autonomousEvents],
-        result,
-      });
+      active.host.complete(active.history ? { ...result, history: active.history } : result);
     } catch (error) {
       this.#fail(
         new PiRpcFaultError(
@@ -1368,7 +1466,21 @@ export class PiRpcSession {
       }, request.timeoutMs);
     }
     active.interactions.set(requestId, pending);
+    // A prompt waiting on the user (command, before_agent_start) must not time out.
+    for (const candidate of this.#pending.values()) {
+      if (candidate.command !== "prompt" || !candidate.timeout) continue;
+      clearTimeout(candidate.timeout);
+      candidate.timeout = null;
+    }
     active.onEvent({ type: "interaction.requested", request });
+  }
+
+  #resumePromptTimeouts(): void {
+    for (const [id, pending] of this.#pending) {
+      if (pending.command === "prompt" || pending.command === "compact") {
+        this.#armCommandTimeout(id, pending);
+      }
+    }
   }
 
   #handleResponse(value: Record<string, unknown>): void {
@@ -1454,13 +1566,32 @@ export class PiRpcSession {
 
   async #confirmSettledTurn(active: ActiveTurn): Promise<void> {
     try {
-      const response = await this.#send("get_state", {});
-      const state = parseSessionState(response);
-      if (parseSessionStreaming(response)) {
-        throw new PiRpcFaultError("protocolError", "Pi RPC agent_settled state is still Streaming");
+      let response: Record<string, unknown>;
+      for (;;) {
+        const activity = active.activity;
+        const signals = active.settleSignals;
+        response = await this.#send("get_state", {});
+        if (this.#activeTurn !== active) return;
+        // Work started from agent_settled (deferred prompt, extension wake) continues this Turn.
+        let stable = !parseSessionStreaming(response) && active.activity === activity;
+        if (stable) {
+          // Snapshot history while this Turn still owns the transport, so a following autonomous
+          // run cannot leak its User Entry into this Turn's checkpoint, and autonomous Turns get
+          // their real Pi identity instead of a provisional key.
+          const entries = parseSessionHistory(await this.#send("get_entries", {}));
+          if (this.#activeTurn !== active) return;
+          stable = active.activity === activity;
+          active.history = entries;
+        }
+        if (stable) break;
+        if (active.settleSignals === signals) {
+          active.settlement = "pending";
+          return;
+        }
       }
-      if (this.#activeTurn !== active) return;
+      const state = parseSessionState(response);
       this.#state = state;
+      this.#lastSettledHistory = active.history ?? this.#lastSettledHistory;
       active.settlement = "confirmed";
       this.#finishSettledTurn(active);
     } catch (error) {
@@ -1498,7 +1629,13 @@ export class PiRpcSession {
     }
     this.#activeTurn = null;
     if (active.origin === "autonomous") {
-      if (active.failure) {
+      if (active.cancellation === "accepted") {
+        this.#emitAutonomousTurn(active, {
+          status: "cancelled",
+          text: active.text,
+          reason: "Cancelled by user",
+        });
+      } else if (active.failure) {
         this.#emitAutonomousTurn(
           active,
           active.nativeCancellationObserved
@@ -1520,14 +1657,19 @@ export class PiRpcSession {
       }
       return;
     }
+    const history = active.history ? { history: active.history } : {};
     if (active.cancellation === "accepted") {
-      active.resolve({ text: active.text, cancelled: true });
+      active.resolve({ text: active.text, cancelled: true, ...history });
     } else if (active.failure) {
       active.reject(active.failure);
-    } else if (active.text.trim().length === 0 && !active.sawTool) {
+    } else if (
+      active.text.trim().length === 0 &&
+      !active.sawTool &&
+      active.disposition !== "handled"
+    ) {
       active.reject(new Error("Pi RPC settled without displayable output"));
     } else {
-      active.resolve({ text: active.text, cancelled: false });
+      active.resolve({ text: active.text, cancelled: false, ...history });
     }
   }
 
@@ -1564,7 +1706,7 @@ export class PiRpcSession {
     }
 
     active.failure = failure;
-    if (active.origin === "autonomous" && isRecord(value) && value.stopReason === "aborted") {
+    if (active.origin === "autonomous" && isRecord(value) && isPiAbortStop(value)) {
       active.nativeCancellationObserved = true;
     }
     this.#latestCacheHitRatePercent = cacheHitRatePercent;
@@ -1632,7 +1774,8 @@ export class PiRpcSession {
     if (
       pending.timeout ||
       this.#pending.get(id) !== pending ||
-      ((pending.command === "prompt" || pending.command === "compact") && this.#compactionActive)
+      ((pending.command === "prompt" || pending.command === "compact") && this.#compactionActive) ||
+      (pending.command === "prompt" && (this.#activeTurn?.interactions.size ?? 0) > 0)
     ) {
       return;
     }
@@ -1681,6 +1824,7 @@ export class PiRpcSession {
         reason,
       });
     }
+    this.#resumePromptTimeouts();
   }
 
   #rejectActiveTurn(error: Error): void {
