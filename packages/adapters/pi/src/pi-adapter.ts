@@ -68,7 +68,6 @@ import {
   hostTurnIdSchema,
   nativeCheckpointRefSchema,
   nativeSessionRefSchema,
-  nativeTurnRefSchema,
   type HarnessId,
   type HostInteractionId,
   type HostItemId,
@@ -104,6 +103,8 @@ import {
   type PiRpcSessionOptions,
   type PiSessionState,
   type PiAutonomousTurn,
+  type PiAutonomousTurnCompletion,
+  type PiAutonomousTurnHost,
   type PiCompactResult,
   type PiTurnEvent,
   type PiTurnResult,
@@ -138,7 +139,9 @@ export interface PiTurnTransport {
   readonly stderrTail?: string;
   setSubagentStatusHandler?(handler: (runs: PiSubagentNode[]) => void): void;
   inspectSubagent?(id: string): Promise<PiSubagentInspection>;
-  setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => void): void;
+  /** True while a Turn, requested or autonomous, owns the transport. */
+  readonly hasActiveTurn?: boolean;
+  setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => PiAutonomousTurnHost | null): void;
   /** Finished assistant messages, for Host usage metering; absent on transports without it. */
   setUsageHandler?(handler: (observation: PiUsageObservation) => void): void;
   start(): Promise<unknown>;
@@ -194,6 +197,13 @@ interface ActiveTurn {
   beforeNativeTurnKeys: Set<string>;
   completion: Promise<void>;
   resolveCompletion(): void;
+}
+
+interface PendingAutonomousTurn {
+  transport: PiTurnTransport;
+  turn: PiAutonomousTurn;
+  active: ActiveTurn | null;
+  result: PiAutonomousTurnCompletion | null;
 }
 
 type SessionPhase = "open" | "closing" | "closed" | "faulted";
@@ -440,12 +450,34 @@ class PiHarnessSession implements HarnessSession {
   readonly #requestedThinkingOptionId: HarnessThinkingOptionId | undefined;
   readonly #toolOutputLimit: number;
   readonly #isFastSupported: (ref: HarnessModelRef, transport: PiTurnTransport) => Promise<boolean>;
-  #acceptingTurn = false;
-  #active: ActiveTurn | null = null;
+  // Whenever the Host becomes free, start any autonomous Turn waiting for it.
+  #acceptingTurnValue = false;
+  #activeValue: ActiveTurn | null = null;
+  #configuringValue = false;
+  get #acceptingTurn(): boolean {
+    return this.#acceptingTurnValue;
+  }
+  set #acceptingTurn(value: boolean) {
+    this.#acceptingTurnValue = value;
+    if (!value) queueMicrotask(() => this.#drainPendingAutonomousTurns());
+  }
+  get #active(): ActiveTurn | null {
+    return this.#activeValue;
+  }
+  set #active(value: ActiveTurn | null) {
+    this.#activeValue = value;
+    if (!value) queueMicrotask(() => this.#drainPendingAutonomousTurns());
+  }
+  get #configuring(): boolean {
+    return this.#configuringValue;
+  }
+  set #configuring(value: boolean) {
+    this.#configuringValue = value;
+    if (!value) queueMicrotask(() => this.#drainPendingAutonomousTurns());
+  }
   #closePromise: Promise<void> | null = null;
-  #configuring = false;
   #phase: SessionPhase = "open";
-  #pendingAutonomousTurns: Array<{ transport: PiTurnTransport; turn: PiAutonomousTurn }> = [];
+  #pendingAutonomousTurns: PendingAutonomousTurn[] = [];
   #starting: Promise<PiTurnTransport> | null = null;
   #state: HarnessSessionState = {};
   #transport: PiTurnTransport | null = null;
@@ -654,6 +686,8 @@ class PiHarnessSession implements HarnessSession {
       if (this.#phase !== "open") {
         return { ok: false, error: invalidState("Pi Session became unavailable during startup") };
       }
+      const busyBeforeHistory = this.#autonomousBusy(transport);
+      if (busyBeforeHistory) return busyBeforeHistory;
 
       let beforeHistory: HostThreadSnapshot;
       try {
@@ -664,6 +698,8 @@ class PiHarnessSession implements HarnessSession {
       } catch (error) {
         return { ok: false, error: normalizedError(error, "protocolError") };
       }
+      const busyAfterHistory = this.#autonomousBusy(transport);
+      if (busyAfterHistory) return busyAfterHistory;
 
       let resolveCompletion = (): void => undefined;
       const completion = new Promise<void>((resolve) => {
@@ -699,18 +735,15 @@ class PiHarnessSession implements HarnessSession {
         .runTurn(text, (event) => this.#handleTurnEvent(active, event))
         .then(async (result) => {
           try {
-            const identity = await this.#completedTurnIdentity(active, transport);
+            const identity = await this.#completedTurnIdentity(active, transport, result.history);
+            const checkpoint = identity ? { checkpoint: identity.checkpoint } : {};
             this.#completeTurn(
               active,
               result.cancelled
-                ? {
-                    status: "cancelled",
-                    reason: "Cancelled by user",
-                    checkpoint: identity.checkpoint,
-                  }
-                : { status: "succeeded", checkpoint: identity.checkpoint },
+                ? { status: "cancelled", reason: "Cancelled by user", ...checkpoint }
+                : { status: "succeeded", ...checkpoint },
               result.text,
-              identity.nativeTurnRef,
+              identity?.nativeTurnRef,
             );
           } catch (error) {
             this.#completeTurn(active, {
@@ -723,7 +756,7 @@ class PiHarnessSession implements HarnessSession {
           let identity:
             { nativeTurnRef: NativeTurnRef; checkpoint: NativeCheckpointRef } | undefined;
           try {
-            identity = await this.#completedTurnIdentity(active, transport);
+            identity = (await this.#completedTurnIdentity(active, transport)) ?? undefined;
           } catch {
             // A failed native Turn may not have persisted a stable User Entry.
           }
@@ -1068,6 +1101,8 @@ class PiHarnessSession implements HarnessSession {
       } catch (error) {
         return { ok: false, error: normalizedError(error, "unavailable") };
       }
+      const busy = this.#autonomousBusy(transport);
+      if (busy) return busy;
       const turnCommand: TurnStartCommand = {
         type: "turn.start",
         turnId: command.turnId,
@@ -1204,55 +1239,119 @@ class PiHarnessSession implements HarnessSession {
       else if (record?.kind === "missing") this.#event({ type: "usage.history", complete: false });
     });
     transport.setAutonomousTurnHandler((turn) => {
-      if (this.#phase !== "open") return;
-      if (this.#transport !== transport) {
-        this.#pendingAutonomousTurns.push({ transport, turn });
-        return;
-      }
-      this.#handleAutonomousTurn(transport, turn);
+      if (this.#phase !== "open") return null;
+      // Queue the live autonomous Turn; it is shown as soon as the Host is free.
+      const pending: PendingAutonomousTurn = {
+        transport,
+        turn,
+        active: null,
+        result: null,
+      };
+      this.#pendingAutonomousTurns.push(pending);
+      this.#drainPendingAutonomousTurns();
+      return {
+        complete: (result) => {
+          pending.result = result;
+          if (pending.active) this.#finishAutonomousTurn(pending);
+        },
+      };
     });
   }
 
-  #drainPendingAutonomousTurns(transport: PiTurnTransport): void {
-    if (this.#pendingSubagentStatus) {
+  #autonomousBusy(transport: PiTurnTransport): HarnessResult<never> | null {
+    if (
+      !transport.hasActiveTurn &&
+      !this.#pendingAutonomousTurns.some((candidate) => candidate.transport === transport)
+    ) {
+      return null;
+    }
+    return {
+      ok: false,
+      error: {
+        code: "sessionBusy",
+        message: "Pi Session is running an autonomous Turn",
+        retryable: true,
+      },
+    };
+  }
+
+  #drainPendingAutonomousTurns(transport: PiTurnTransport | null = this.#transport): void {
+    if (transport && this.#transport === transport && this.#pendingSubagentStatus) {
       this.#subagents.observe(this.#pendingSubagentStatus);
       this.#pendingSubagentStatus = null;
     }
-    const pending = this.#pendingAutonomousTurns.filter(
+    if (
+      this.#phase !== "open" ||
+      !transport ||
+      this.#transport !== transport ||
+      this.#active ||
+      this.#acceptingTurn ||
+      this.#configuring
+    ) {
+      return;
+    }
+    const index = this.#pendingAutonomousTurns.findIndex(
       (candidate) => candidate.transport === transport,
     );
-    this.#pendingAutonomousTurns = this.#pendingAutonomousTurns.filter(
-      (candidate) => candidate.transport !== transport,
-    );
-    for (const candidate of pending) {
-      if (this.#phase !== "open") return;
-      this.#handleAutonomousTurn(transport, candidate.turn);
+    if (index < 0) return;
+    const [pending] = this.#pendingAutonomousTurns.splice(index, 1);
+    this.#handleAutonomousTurn(transport, pending as PendingAutonomousTurn);
+  }
+
+  #finishAutonomousTurn(pending: PendingAutonomousTurn): void {
+    const { active, result } = pending;
+    if (!active || !result || this.#active !== active) return;
+    const identity = this.#autonomousTurnIdentity(pending, result);
+    const nativeTurnRef = identity?.nativeTurnRef;
+    const checkpoint = identity?.checkpoint ? { checkpoint: identity.checkpoint } : {};
+    if (result.status === "succeeded") {
+      this.#completeTurn(
+        active,
+        { status: "succeeded", ...checkpoint },
+        result.text,
+        nativeTurnRef,
+      );
+    } else if (result.status === "cancelled") {
+      this.#completeTurn(
+        active,
+        { status: "cancelled", reason: result.reason, ...checkpoint },
+        result.text,
+        nativeTurnRef,
+      );
+    } else {
+      this.#completeTurn(
+        active,
+        { status: "failed", error: normalizedError(result.error, "nativeFailure"), ...checkpoint },
+        result.text,
+        nativeTurnRef,
+      );
     }
   }
 
-  #handleAutonomousTurn(transport: PiTurnTransport, turn: PiAutonomousTurn): void {
-    if (this.#phase !== "open") return;
-    if (this.#transport !== transport) {
-      this.#fault(
-        new PiAdapterFaultError({
-          code: "protocolError",
-          message: "Pi autonomous Turn came from a non-active transport",
-          retryable: false,
-        }),
-      );
-      return;
-    }
-    if (this.#active || this.#acceptingTurn || this.#configuring) {
-      this.#fault(
-        new PiAdapterFaultError({
-          code: "protocolError",
-          message: "Pi autonomous Turn overlapped another Host operation",
-          retryable: false,
-        }),
-      );
-      return;
-    }
+  /**
+   * The persisted Turn the RPC confirmed for this run, so the Host maps the live Turn to it; the
+   * Checkpoint is the run's last Turn. Generated IDs never stand in: a run that persisted no
+   * Assistant has no native identity.
+   */
+  #autonomousTurnIdentity(
+    pending: PendingAutonomousTurn,
+    result: PiAutonomousTurnCompletion,
+  ): { nativeTurnRef: NativeTurnRef; checkpoint?: NativeCheckpointRef } | null {
+    if (!result.history || !result.nativeTurnKey) return null;
+    const { transport } = pending;
+    const turns = mapPiSnapshot(result.history, {
+      sessionId: transport.state.sessionId,
+      model: nativeModelForHistory(transport.state),
+    }).turns;
+    const first = turns.find((turn) => turn.nativeTurnRef.nativeTurnKey === result.nativeTurnKey);
+    if (!first) return null;
+    // The history was read when this run settled, so every Turn from `first` on belongs to it.
+    const checkpoint = turns.at(-1)?.checkpoint;
+    return { nativeTurnRef: first.nativeTurnRef, ...(checkpoint ? { checkpoint } : {}) };
+  }
 
+  #handleAutonomousTurn(transport: PiTurnTransport, pending: PendingAutonomousTurn): void {
+    const turn = pending.turn;
     const turnId = hostTurnIdSchema.parse(randomUUID());
     let resolveCompletion = (): void => undefined;
     const completion = new Promise<void>((resolve) => {
@@ -1278,69 +1377,19 @@ class PiHarnessSession implements HarnessSession {
       completion,
       resolveCompletion,
     };
-    const nativeTurnRef = turn.nativeTurnKey
-      ? nativeTurnRefSchema.parse({
-          harnessId: this.harnessId,
-          nativeSessionId: transport.state.sessionId,
-          nativeTurnKey: turn.nativeTurnKey,
-          formatVersion: 1,
-        })
-      : undefined;
-    const checkpoint = nativeTurnRef
-      ? nativeCheckpointRefSchema.parse({
-          harnessId: this.harnessId,
-          nativeSessionId: transport.state.sessionId,
-          checkpointId: nativeTurnRef.nativeTurnKey,
-          formatVersion: 1,
-        })
-      : undefined;
     this.#active = active;
+    pending.active = active;
     this.#event({ type: "turn.autonomous.started", turnId, input: [] });
     this.#event({ type: "turn.started", turnId });
     this.#event({ type: "item.started", turnId, item });
 
     try {
-      for (const event of turn.events) this.#handleTurnEvent(active, event);
-      if (turn.result.status === "succeeded") {
-        if (!nativeTurnRef) throw new Error("Pi autonomous Turn has no native identity");
-        this.#completeTurn(
-          active,
-          { status: "succeeded", ...(checkpoint ? { checkpoint } : {}) },
-          turn.result.text,
-          nativeTurnRef,
-        );
-      } else if (turn.result.status === "cancelled") {
-        this.#completeTurn(
-          active,
-          {
-            status: "cancelled",
-            reason: turn.result.reason,
-            ...(checkpoint ? { checkpoint } : {}),
-          },
-          turn.result.text,
-          nativeTurnRef,
-        );
-      } else {
-        this.#completeTurn(
-          active,
-          {
-            status: "failed",
-            error: normalizedError(turn.result.error, "nativeFailure"),
-            ...(checkpoint ? { checkpoint } : {}),
-          },
-          turn.result.text,
-          nativeTurnRef,
-        );
-      }
+      turn.attach((event) => this.#handleTurnEvent(active, event));
+      this.#finishAutonomousTurn(pending);
     } catch (error) {
       const normalized = normalizedError(error, "protocolError");
       if (this.#active === active) {
-        this.#completeTurn(
-          active,
-          { status: "failed", error: normalized },
-          undefined,
-          nativeTurnRef,
-        );
+        this.#completeTurn(active, { status: "failed", error: normalized });
       }
       this.#fault(new PiAdapterFaultError(normalized));
     }
@@ -1784,22 +1833,21 @@ class PiHarnessSession implements HarnessSession {
   async #completedTurnIdentity(
     active: ActiveTurn,
     transport: PiTurnTransport,
-  ): Promise<{ nativeTurnRef: NativeTurnRef; checkpoint: NativeCheckpointRef }> {
-    const snapshot = mapPiSnapshot(await transport.getEntries(), {
+    history?: PiSessionHistory,
+  ): Promise<{ nativeTurnRef: NativeTurnRef; checkpoint: NativeCheckpointRef } | null> {
+    const snapshot = mapPiSnapshot(history ?? (await transport.getEntries()), {
       sessionId: transport.state.sessionId,
       model: nativeModelForHistory(transport.state),
     });
     const created = snapshot.turns.filter(
       (turn) => !active.beforeNativeTurnKeys.has(turn.nativeTurnRef.nativeTurnKey),
     );
-    if (created.length !== 1) {
-      throw new Error(
-        `Pi Turn persisted ${created.length} new User Entries; exactly one is required`,
-      );
-    }
-    const turn = created[0];
-    if (!turn?.checkpoint) throw new Error("Pi Turn has no terminal Checkpoint identity");
-    return { nativeTurnRef: turn.nativeTurnRef, checkpoint: turn.checkpoint };
+    // Handled commands and custom-message runs add no User Entry; extension messages can add several.
+    if (created.length === 0) return null;
+    const turn = created[0] as (typeof created)[number];
+    const terminal = created.at(-1);
+    if (!terminal?.checkpoint) throw new Error("Pi Turn has no terminal Checkpoint identity");
+    return { nativeTurnRef: turn.nativeTurnRef, checkpoint: terminal.checkpoint };
   }
 
   #completeTurn(
