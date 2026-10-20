@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, readFileSync, statSync } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
 
@@ -13,17 +13,21 @@ function state(value: unknown): unknown {
   return value === "pending" ? "queued" : value === "completed" ? "complete" : value;
 }
 
-/** Project only documented lifecycle v3 artifacts; do not import the plugin's private runtime. */
+/**
+ * Project only documented lifecycle v3 artifacts; do not import the plugin's private runtime.
+ * pi-subagents records the parent's session file as the owner when it has one, so ownership
+ * accepts any of the parent Session's identities; `null` skips it for the live parent's receipt.
+ */
 export function piSubagentArtifact(
   value: unknown,
   runId: string,
-  parentSessionId: string,
+  owners: ReadonlySet<string> | null,
 ): PiSubagentNode[] | null {
   if (
     !record(value) ||
     value.lifecycleArtifactVersion !== 3 ||
     value.runId !== runId ||
-    value.sessionId !== parentSessionId ||
+    (owners !== null && (typeof value.sessionId !== "string" || !owners.has(value.sessionId))) ||
     !["single", "parallel", "chain", "workflow"].includes(String(value.mode))
   )
     return null;
@@ -66,7 +70,7 @@ export function piSubagentArtifact(
 /** Restored cards use parent-owned native receipts, never arbitrary filesystem paths supplied by the UI. */
 export async function restorePiSubagents(
   history: PiSessionHistory,
-  parentSessionId: string,
+  owners: ReadonlySet<string>,
   observer: PiSubagents,
 ): Promise<void> {
   const receipts = new Map<string, string>();
@@ -104,7 +108,7 @@ export async function restorePiSubagents(
       const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
       if (bytesRead > 1024 * 1024) continue;
       const value: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
-      const runs = piSubagentArtifact(value, id, parentSessionId);
+      const runs = piSubagentArtifact(value, id, owners);
       if (runs) observer.restore(runs);
     } catch {
       // Artifact retention and status publication races are not parent Session failures.
@@ -112,4 +116,30 @@ export async function restorePiSubagents(
       await file?.close();
     }
   }
+}
+
+/**
+ * The live launch receipt can arrive before the run's first status snapshot. Read the run's
+ * status.json from the receipt; a single run without one is shown as running.
+ */
+export function piSubagentReceiptRuns(runId: string, details: unknown): PiSubagentNode[] | null {
+  if (
+    !record(details) ||
+    typeof details.asyncDir !== "string" ||
+    !path.isAbsolute(details.asyncDir) ||
+    path.basename(details.asyncDir) !== runId
+  )
+    return null;
+  try {
+    const file = path.join(details.asyncDir, "status.json");
+    if (statSync(file).size <= 1024 * 1024) {
+      const runs = piSubagentArtifact(JSON.parse(readFileSync(file, "utf8")), runId, null);
+      if (runs) return runs;
+    }
+  } catch {
+    // Not written yet, pruned, or mid-write.
+  }
+  return details.mode === "single"
+    ? [{ id: runId, kind: "subagent", label: "Pi subagent", state: "running" }]
+    : null;
 }
