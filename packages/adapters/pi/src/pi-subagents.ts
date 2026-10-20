@@ -201,9 +201,19 @@ function asyncRunId(toolName: string, result: unknown): string | null {
 export class PiSubagents {
   readonly #children = new Map<string, Map<string, HostSubagentState>>();
   readonly #active = new Map<string, { turnId: HostTurnId; item: HostSubagentDelegationItem }>();
-  readonly #waiting = new Map<string, { turnId: HostTurnId; itemId: HostItemId }>();
+  readonly #waiting = new Map<
+    string,
+    { turnId: HostTurnId; itemId: HostItemId; details: unknown }
+  >();
 
-  constructor(private readonly emit: (event: HostEvent) => void) {}
+  /** `receiptRuns` reads a launch receipt's run status when no snapshot arrived before the Turn ended. */
+  constructor(
+    private readonly emit: (event: HostEvent) => void,
+    private readonly receiptRuns: (
+      runId: string,
+      details: unknown,
+    ) => PiSubagentNode[] | null = () => null,
+  ) {}
 
   observe(runs: PiSubagentNode[]): void {
     this.#apply(runs, true);
@@ -321,7 +331,7 @@ export class PiSubagents {
     const item = this.project(toolName, result, itemId);
     if (!runId || this.#active.has(runId)) return;
     if (!item) {
-      this.#waiting.set(runId, { turnId, itemId });
+      this.#waiting.set(runId, { turnId, itemId, details: record(result) ? result.details : null });
       return;
     }
     this.#active.set(runId, { turnId, item });
@@ -329,8 +339,13 @@ export class PiSubagents {
   }
 
   finish(turnId: HostTurnId): void {
-    for (const [runId, waiting] of this.#waiting) {
-      if (waiting.turnId === turnId) this.#waiting.delete(runId);
+    // The receipt can beat the first status snapshot; a card not started before the Turn closes
+    // is never shown.
+    for (const [runId, waiting] of [...this.#waiting]) {
+      if (waiting.turnId !== turnId) continue;
+      const runs = this.receiptRuns(runId, waiting.details);
+      if (runs) this.#apply(runs, true);
+      this.#waiting.delete(runId);
     }
     for (const [runId, active] of this.#active) {
       if (active.turnId !== turnId) continue;
