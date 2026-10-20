@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   activePiEntries,
+  isPiAbortStop,
   mapPiSnapshot,
   resolvePiForkBoundary,
   resolvePiLastTurnBoundary,
@@ -393,5 +394,17 @@ describe("Pi active-branch history", () => {
     expect(() => activePiEntries({ entries: history.entries, leafId: "missing" })).toThrow(
       "missing Entry",
     );
+  });
+});
+
+describe("isPiAbortStop", () => {
+  it("accepts the aborted stop reason and the native aborted error messages only", () => {
+    expect(isPiAbortStop({ stopReason: "aborted" })).toBe(true);
+    expect(isPiAbortStop({ stopReason: "error", errorMessage: "This operation was aborted" })).toBe(
+      true,
+    );
+    expect(isPiAbortStop({ stopReason: "error", errorMessage: "Request was aborted" })).toBe(true);
+    expect(isPiAbortStop({ stopReason: "error", errorMessage: "boom" })).toBe(false);
+    expect(isPiAbortStop({ stopReason: "stop" })).toBe(false);
   });
 });
