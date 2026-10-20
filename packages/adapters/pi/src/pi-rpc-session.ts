@@ -182,6 +182,7 @@ interface ManualCompaction {
   onEvent(event: PiTurnEvent): void;
   resolve(result: PiCompactResult): void;
   reject(error: Error): void;
+  cancelRequested?: boolean;
 }
 
 interface ActiveTurn {
@@ -709,7 +710,11 @@ export class PiRpcSession {
     } catch (error) {
       const pending = this.#manualCompaction as ManualCompaction | null;
       this.#manualCompaction = null;
-      pending?.reject(error instanceof Error ? error : new Error(message(error)));
+      if (pending?.cancelRequested && !(error instanceof PiRpcFaultError)) {
+        pending.resolve({ outcome: "cancelled" });
+      } else {
+        pending?.reject(error instanceof Error ? error : new Error(message(error)));
+      }
     }
     return result;
   }
@@ -945,6 +950,12 @@ export class PiRpcSession {
 
   abort(): Promise<void> {
     const active = this.#activeTurn;
+    // A manual compaction has no Turn; Pi's abort cancels it and reports compaction_end with
+    // aborted: true, which completes the compaction as cancelled.
+    if (!active && this.#manualCompaction && !this.#closed && !this.#failed) {
+      this.#manualCompaction.cancelRequested = true;
+      return this.#send("abort", {}).then(() => undefined);
+    }
     if (!active || this.#closed || this.#failed) {
       return Promise.reject(new Error("Pi RPC Session has no cancellable Turn"));
     }
@@ -1055,6 +1066,10 @@ export class PiRpcSession {
     if (this.#subagents.handle(value)) return;
     this.#observeUsage(value);
     if (value.type === "compaction_start") {
+      // An abort sent before Pi started compacting found nothing to cancel.
+      if (!this.#activeTurn && this.#manualCompaction?.cancelRequested) {
+        void this.#send("abort", {}).catch(() => undefined);
+      }
       this.#compactionActive = true;
       this.#compactionTurn = this.#activeTurn;
       const onEvent = this.#activeTurn?.onEvent ?? this.#manualCompaction?.onEvent;
