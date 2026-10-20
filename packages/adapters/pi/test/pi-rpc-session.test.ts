@@ -503,6 +503,11 @@ class FakePiRpcProcess extends EventEmitter {
       this.#startInteractionTurn(command);
       return;
     }
+    if (command.type === "abort" && this.#scenario === "manual-compaction-stalled") {
+      this.#respond(command);
+      this.#output({ type: "compaction_end", reason: "manual", aborted: true, willRetry: false });
+      return;
+    }
     if (command.type === "abort" && this.#scenario === "cancel-slow-settle") {
       // The Abort acknowledgement and settlement arrive well past the former 2s bound.
       setTimeout(() => {
@@ -1514,6 +1519,21 @@ describe("Pi RPC Turn aggregation", () => {
       }
     },
   );
+
+  it("cancels a manual Compact, which has no Turn, through Pi's abort", async () => {
+    const onFault = vi.fn();
+    const rpc = session("manual-compaction-stalled", onFault);
+    const events: PiTurnEvent[] = [];
+    await rpc.start();
+    const compact = rpc.compact(undefined, (event) => events.push(event));
+    await vi.waitFor(() => expect(events).toEqual([{ type: "compaction.started" }]));
+
+    await expect(rpc.abort()).resolves.toBeUndefined();
+    await expect(compact).resolves.toEqual({ outcome: "cancelled" });
+    expect(events.at(-1)).toEqual({ type: "compaction.completed", outcome: "cancelled" });
+    expect(onFault).not.toHaveBeenCalled();
+    await rpc.close();
+  });
 
   it("keeps a stalled manual Compact pending until the Session closes", async () => {
     vi.useFakeTimers();
