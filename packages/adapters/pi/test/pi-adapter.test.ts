@@ -39,6 +39,8 @@ import type { PiNativeCommand } from "../src/pi-slash-commands.js";
 import {
   PiRpcFaultError,
   type PiAutonomousTurn,
+  type PiAutonomousTurnCompletion,
+  type PiAutonomousTurnHost,
   type PiCompactResult,
   type PiInteractionResponse,
   type PiRpcSessionOptions,
@@ -49,10 +51,13 @@ import {
 
 class FakePiTransport implements PiTurnTransport {
   readonly stderrTail = "Pi could not read ~/.pi/agent/settings.json";
-  autonomousHandler: ((turn: PiAutonomousTurn) => void) | null = null;
-  readonly setAutonomousTurnHandler = vi.fn((handler: (turn: PiAutonomousTurn) => void) => {
-    this.autonomousHandler = handler;
-  });
+  hasActiveTurn = false;
+  autonomousHandler: ((turn: PiAutonomousTurn) => PiAutonomousTurnHost | null) | null = null;
+  readonly setAutonomousTurnHandler = vi.fn(
+    (handler: (turn: PiAutonomousTurn) => PiAutonomousTurnHost | null) => {
+      this.autonomousHandler = handler;
+    },
+  );
   usageHandler: ((observation: PiUsageObservation) => void) | null = null;
   readonly setUsageHandler = vi.fn((handler: (observation: PiUsageObservation) => void) => {
     this.usageHandler = handler;
@@ -197,36 +202,57 @@ class FakePiTransport implements PiTurnTransport {
     this.onEvent(event);
   }
 
-  autonomous(turn: PiAutonomousTurn): void {
+  /**
+   * Starts an autonomous Pi run triggered by custom Entry `nativeEntryId`. Completing it persists
+   * that Entry and its Assistant, and reports the identity the RPC confirms, like Pi does.
+   */
+  autonomous(nativeEntryId: string): PiAutonomousTurnHost | null {
     if (!this.autonomousHandler) throw new Error("No autonomous Pi Turn handler");
-    if (!turn.nativeTurnKey) throw new Error("Fake autonomous Turn has no native Entry");
-    this.history.entries.push(
-      {
-        id: turn.nativeTurnKey,
-        parentId: this.history.leafId,
-        type: "custom_message",
-        customType: "intercom_message",
-        content: "background result",
-        display: false,
+    const events: PiTurnEvent[] = [
+      { type: "text.delta", messageId: nativeEntryId, delta: "autonomous answer" },
+      { type: "message.completed", messageId: nativeEntryId },
+    ];
+    const host = this.autonomousHandler({
+      attach(sink) {
+        for (const event of events) sink(event);
       },
-      {
-        id: `${turn.nativeTurnKey}-answer`,
-        parentId: turn.nativeTurnKey,
-        type: "message",
-        message: {
-          role: "assistant",
-          content: turn.result.text,
-          stopReason:
-            turn.result.status === "cancelled"
-              ? "aborted"
-              : turn.result.status === "failed"
-                ? "error"
-                : "stop",
-        },
+    });
+    if (!host) return null;
+    return {
+      complete: (result) => {
+        this.history.entries.push(
+          {
+            id: nativeEntryId,
+            parentId: this.history.leafId,
+            type: "custom_message",
+            customType: "intercom_message",
+            content: "background result",
+            display: false,
+          },
+          {
+            id: `${nativeEntryId}-answer`,
+            parentId: nativeEntryId,
+            type: "message",
+            message: {
+              role: "assistant",
+              content: result.text,
+              stopReason:
+                result.status === "cancelled"
+                  ? "aborted"
+                  : result.status === "failed"
+                    ? "error"
+                    : "stop",
+            },
+          },
+        );
+        this.history.leafId = `${nativeEntryId}-answer`;
+        host.complete({
+          ...result,
+          history: structuredClone(this.history),
+          nativeTurnKey: nativeEntryId,
+        });
       },
-    );
-    this.history.leafId = `${turn.nativeTurnKey}-answer`;
-    this.autonomousHandler(turn);
+    };
   }
 
   delta(text: string, messageId?: string): void {
@@ -386,19 +412,10 @@ function cancelTurn(id: string) {
   return { type: "turn.cancel" as const, turnId: hostTurnIdSchema.parse(id) };
 }
 
-function autonomousTurn(
-  nativeTurnKey: string,
-  result: PiAutonomousTurn["result"] = { status: "succeeded", text: "autonomous answer" },
-): PiAutonomousTurn {
-  return {
-    nativeTurnKey,
-    events: [
-      { type: "text.delta", messageId: nativeTurnKey, delta: "autonomous answer" },
-      { type: "message.completed", messageId: nativeTurnKey },
-    ],
-    result,
-  };
-}
+const autonomousSucceeded: PiAutonomousTurnCompletion = {
+  status: "succeeded",
+  text: "autonomous answer",
+};
 
 function isUsageMetering(output: HarnessOutput): boolean {
   return (
@@ -1560,7 +1577,7 @@ describe("Pi HarnessAdapter Session", () => {
     await nextEvent(iterator);
     await nextEvent(iterator);
 
-    transport.autonomous(autonomousTurn("pi-autonomous-response"));
+    transport.autonomous("pi-autonomous-response")?.complete(autonomousSucceeded);
 
     const autonomousStarted = await nextEvent(iterator);
     expect(autonomousStarted).toMatchObject({
@@ -1633,7 +1650,7 @@ describe("Pi HarnessAdapter Session", () => {
     expect(transport.start).toHaveBeenCalledOnce();
     expect(transport.setAutonomousTurnHandler).toHaveBeenCalledOnce();
 
-    transport.autonomous(autonomousTurn("resumed-autonomous"));
+    transport.autonomous("resumed-autonomous")?.complete(autonomousSucceeded);
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.autonomous.started", input: [] });
     await nextEvent(iterator);
     await nextEvent(iterator);
@@ -1674,8 +1691,8 @@ describe("Pi HarnessAdapter Session", () => {
         { status: "failed", text: "autonomous answer", error: new Error("native failed") },
         "failed",
       ],
-    ] as const) {
-      transport.autonomous(autonomousTurn(key, result));
+    ] as const satisfies readonly (readonly [string, PiAutonomousTurnCompletion, string])[]) {
+      transport.autonomous(key)?.complete(result);
       await nextEvent(iterator);
       await nextEvent(iterator);
       await nextEvent(iterator);
@@ -1692,7 +1709,7 @@ describe("Pi HarnessAdapter Session", () => {
     await session.close();
   });
 
-  it("faults instead of merging an autonomous callback with a requested Host Turn", async () => {
+  it("queues an autonomous Turn behind a requested Host Turn instead of faulting", async () => {
     const { adapter, transports } = fixture();
     const session = await openSession(adapter);
     const iterator = session.outputs[Symbol.asyncIterator]();
@@ -1703,21 +1720,37 @@ describe("Pi HarnessAdapter Session", () => {
     const transport = transports[0];
     if (!transport) throw new Error("Fake transport was not created");
 
-    transport.autonomous(autonomousTurn("overlap-autonomous"));
+    transport.autonomous("overlap-autonomous")?.complete(autonomousSucceeded);
+    transport.succeed("requested answer");
 
-    expect(await nextEvent(iterator)).toMatchObject({
-      type: "item.completed",
-      snapshot: { outcome: { status: "failed", error: { code: "protocolError" } } },
+    const types: string[] = [];
+    for (let index = 0; index < 8; index += 1) types.push((await nextEvent(iterator)).type);
+    expect(types).toContain("turn.autonomous.started");
+    expect(types).not.toContain("session.faulted");
+    await session.close();
+  });
+
+  it("returns a retryable sessionBusy to user Turns while an autonomous Turn is running", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("bootstrap-busy"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    transport.succeed("ready");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    const host = transport.autonomous("busy-autonomous");
+    await expect(session.execute(textTurn("while-autonomous"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "sessionBusy", retryable: true },
     });
-    expect(await nextEvent(iterator)).toMatchObject({
-      type: "turn.completed",
-      outcome: { status: "failed", error: { message: expect.stringContaining("overlapped") } },
-    });
-    expect(await nextEvent(iterator)).toMatchObject({
-      type: "session.faulted",
-      error: { code: "protocolError", message: expect.stringContaining("overlapped") },
-    });
-    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    host?.complete(autonomousSucceeded);
     await session.close();
   });
 
