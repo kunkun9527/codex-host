@@ -78,6 +78,7 @@ import {
 } from "@codexhost/shared-contracts";
 
 import { resolvePiInspectCwd } from "./command.js";
+import { PiInspectionCache } from "./pi-inspection-cache.js";
 import {
   activePiEntries,
   mapPiSnapshot,
@@ -138,6 +139,10 @@ export interface PiAdapterOptions {
   cancelTimeoutMs?: number;
   closeTimeoutMs?: number;
   toolOutputLimit?: number;
+  /** Persists ready inspections across Host runs; absent keeps them in memory only. */
+  inspectionCacheFile?: string;
+  /** Delay before a persisted inspection is revalidated with a fresh Pi process. */
+  inspectionRevalidateDelayMs?: number;
 }
 
 export interface PiTurnTransport {
@@ -2121,6 +2126,9 @@ export class PiAdapter implements HarnessAdapter {
   readonly #createTransport: PiAdapterDependencies["createTransport"];
   readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
   readonly #inspectionInFlight = new Map<string, Promise<HarnessInspection>>();
+  readonly #persistedInspections: PiInspectionCache | null;
+  readonly #inspectionRevalidateDelayMs: number;
+  readonly #revalidations = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #inspections = new Set<PiTurnTransport>();
   readonly #sessions = new Set<PiHarnessSession>();
   readonly #toolOutputLimit: number;
@@ -2138,6 +2146,7 @@ export class PiAdapter implements HarnessAdapter {
     const updateCatalog = async (operation: Promise<void>): Promise<void> => {
       await operation;
       this.#inspectionCache.clear();
+      await this.#persistedInspections?.clear().catch(() => undefined);
     };
     this.credentialImports = {
       providers: imports.providers,
@@ -2153,6 +2162,10 @@ export class PiAdapter implements HarnessAdapter {
     this.usageStatistics = createPiUsageStatistics({ ...process.env, ...options.environment });
     this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+    this.#persistedInspections = options.inspectionCacheFile
+      ? new PiInspectionCache(options.inspectionCacheFile)
+      : null;
+    this.#inspectionRevalidateDelayMs = options.inspectionRevalidateDelayMs ?? 30_000;
   }
 
   /** Pi itself holds no Account; this reports configured Provider balances. */
@@ -2183,10 +2196,43 @@ export class PiAdapter implements HarnessAdapter {
     if (!input.refresh) {
       const cached = this.#inspectionCache.get(cwd);
       if (cached) return cached;
+      const persisted = await this.#persistedInspections?.get(cwd).catch(() => undefined);
+      const current = this.#inspectionCache.get(cwd);
+      if (current) return current;
+      if (persisted && !this.#closePromise && !this.#inspectionInFlight.has(cwd)) {
+        this.#inspectionCache.set(cwd, persisted);
+        this.#thinkingSelectionSupported ??=
+          persisted.capabilities.configuration.selectThinkingOption;
+        this.#scheduleRevalidation(cwd);
+        return persisted;
+      }
     }
+    return this.#runInspection(cwd);
+  }
 
-    const inspection = this.#inspectCwd(cwd).then((result) => {
-      if (result.status === "ready") this.#inspectionCache.set(cwd, result);
+  /** Revalidates a persisted inspection after Host startup has settled. */
+  #scheduleRevalidation(cwd: string): void {
+    if (this.#revalidations.has(cwd)) return;
+    const timer = setTimeout(() => {
+      this.#revalidations.delete(cwd);
+      if (this.#closePromise || this.#inspectionInFlight.has(cwd)) return;
+      void this.#runInspection(cwd);
+    }, this.#inspectionRevalidateDelayMs);
+    timer.unref?.();
+    this.#revalidations.set(cwd, timer);
+  }
+
+  #runInspection(cwd: string): Promise<HarnessInspection> {
+    const inFlight = this.#inspectionInFlight.get(cwd);
+    if (inFlight) return inFlight;
+    const inspection = this.#inspectCwd(cwd).then(async (result) => {
+      if (result.status === "ready") {
+        this.#inspectionCache.set(cwd, result);
+        await this.#persistedInspections?.set(cwd, result).catch(() => undefined);
+      } else {
+        // The next Host run must inspect Pi again instead of trusting an earlier run's catalog.
+        await this.#persistedInspections?.delete(cwd).catch(() => undefined);
+      }
       return result;
     });
     this.#inspectionInFlight.set(cwd, inspection);
@@ -2575,6 +2621,8 @@ export class PiAdapter implements HarnessAdapter {
 
   close(): Promise<void> {
     if (!this.#closePromise) {
+      for (const timer of this.#revalidations.values()) clearTimeout(timer);
+      this.#revalidations.clear();
       this.#closePromise = Promise.all([
         this.#importScope.close(),
         ...[...this.#inspections].map((transport) => transport.close()),

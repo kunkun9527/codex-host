@@ -16,7 +16,7 @@ Pi Adapter 在现有 `inspect()` 获取 Model 目录的同一临时 RPC 进程�
 
 判定不读取本地 OAuth 凭据或 Codex 模型缓存，也不发起能力探测请求。开关表示客户端请求 `priority`，不保证上游接受或实际采用 Fast；上游可能忽略或拒绝该参数。
 
-能力随既有按 cwd 的 Model 目录缓存；显式刷新和凭据导入、重导入、移除沿用现有失效路径，不增加后台轮询。已有会话的 cwd 尚未缓存时，选择 Fast 使用当前 Pi 进程查询模型与扩展能力，再做同样的判定，不另起 inspection 进程，也不借用其他 cwd 的能力结论。
+能力随既有按 cwd 的 Model 目录缓存（含跨 Host 运行的持久缓存，见 [pi-inspection-cache.md](pi-inspection-cache.md)）；显式刷新和凭据导入、重导入、移除沿用现有失效路径，不增加后台轮询。已有会话的 cwd 尚未缓存时，选择 Fast 使用当前 Pi 进程查询模型与扩展能力，再做同样的判定，不另起 inspection 进程，也不借用其他 cwd 的能力结论。
 
 ## 请求与状态
 
