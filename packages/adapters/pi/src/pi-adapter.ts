@@ -79,7 +79,12 @@ import {
 } from "@codexhost/shared-contracts";
 
 import { resolvePiInspectCwd } from "./command.js";
-import { mapPiSnapshot, resolvePiForkBoundary, type PiSessionHistory } from "./pi-history.js";
+import {
+  activePiEntries,
+  mapPiSnapshot,
+  resolvePiForkBoundary,
+  type PiSessionHistory,
+} from "./pi-history.js";
 import { piToolFileChanges } from "./pi-file-change.js";
 import {
   PiSubagents,
@@ -138,7 +143,7 @@ export interface PiTurnTransport {
   readonly state: PiSessionState;
   readonly stderrTail?: string;
   setSubagentStatusHandler?(handler: (runs: PiSubagentNode[]) => void): void;
-  inspectSubagent?(id: string): Promise<PiSubagentInspection>;
+  inspectSubagent?(id: string, queryChildId?: string): Promise<PiSubagentInspection>;
   /** True while a Turn, requested or autonomous, owns the transport. */
   readonly hasActiveTurn?: boolean;
   setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => PiAutonomousTurnHost | null): void;
@@ -225,6 +230,16 @@ const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The parent's own launch result says the async run is single-mode. */
+function piSingleAsyncRun(history: PiSessionHistory, runId: string): boolean {
+  return activePiEntries(history).some(({ message }) => {
+    if (!isRecord(message) || message.role !== "toolResult" || message.toolName !== "subagent")
+      return false;
+    const details = message.details;
+    return isRecord(details) && details.mode === "single" && details.asyncId === runId;
+  });
 }
 
 function errorMessage(error: unknown): string {
@@ -556,14 +571,18 @@ class PiHarnessSession implements HarnessSession {
     return (await this.#ensureTransport()).getEntries();
   }
 
-  async inspectSubagent(id: string, cwd: string): Promise<PiSubagentInspection> {
+  async inspectSubagent(
+    id: string,
+    cwd: string,
+    queryChildId?: string,
+  ): Promise<PiSubagentInspection> {
     if (this.#phase !== "open" || path.resolve(cwd) !== path.resolve(this.#cwd)) {
       throw new Error("Pi Subagent parent workspace or Session is unavailable");
     }
     const transport = await this.#ensureTransport();
     if (!transport.inspectSubagent)
       throw new Error("Pi transport does not support Subagent inspection");
-    return transport.inspectSubagent(id);
+    return transport.inspectSubagent(id, queryChildId);
   }
 
   handleTransportFault(error: PiRpcFaultError): void {
@@ -1953,11 +1972,13 @@ export class PiAdapter implements HarnessAdapter {
           return { ok: false, error: invalidState("Pi Subagent parent is unavailable") };
         }
         const workflow = parsePiWorkflowSubagentId(nativeSubagentId);
-        if (!workflow) parsePiSubagentId(nativeSubagentId);
+        const address = workflow ? null : parsePiSubagentId(nativeSubagentId);
         const live = [...this.#sessions].find((session) =>
           session.ownsNativeSession(parent.nativeSessionId),
         );
         let reply: PiSubagentInspection;
+        let readHistory: () => Promise<PiSessionHistory>;
+        let inspect: (queryChildId?: string) => Promise<PiSubagentInspection>;
         if (live) {
           if (workflow)
             return await readPiWorkflowChild(
@@ -1965,7 +1986,8 @@ export class PiAdapter implements HarnessAdapter {
               parent.nativeSessionId,
               workflow,
             );
-          reply = await live.inspectSubagent(nativeSubagentId, cwd);
+          readHistory = () => live.readSubagentHistory(cwd);
+          inspect = (queryChildId) => live.inspectSubagent(nativeSubagentId, cwd, queryChildId);
         } else {
           const sessionFile = sessionFileFromRef(parent);
           transport = this.#createTransport({ cwd, sessionFile });
@@ -1980,9 +2002,24 @@ export class PiAdapter implements HarnessAdapter {
               parent.nativeSessionId,
               workflow,
             );
-          if (!transport.inspectSubagent)
-            throw new Error("Pi transport does not support Subagent inspection");
-          reply = await transport.inspectSubagent(nativeSubagentId);
+          const started = transport;
+          const inspectStarted = started.inspectSubagent?.bind(started);
+          if (!inspectStarted) throw new Error("Pi transport does not support Subagent inspection");
+          readHistory = () => started.getEntries();
+          inspect = (queryChildId) => inspectStarted(nativeSubagentId, queryChildId);
+        }
+        reply = await inspect();
+        // A running single run publishes its transcript only on steps[0]; the root sessionFile is
+        // written at finalization (pi-subagents docs/observability.md). Its step is the same worker.
+        if (
+          !reply.error &&
+          !reply.messages?.length &&
+          address &&
+          !address.childId &&
+          piSingleAsyncRun(await readHistory(), address.runId)
+        ) {
+          const step = await inspect("step:0");
+          if (!step.error && step.messages?.length) reply = step;
         }
         if (reply.error)
           return {
