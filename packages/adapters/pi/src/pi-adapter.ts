@@ -2259,10 +2259,16 @@ export class PiAdapter implements HarnessAdapter {
     if (!input.refresh) {
       const cached = this.#inspectionCache.get(cwd);
       if (cached) return cached;
+      const generation = this.#catalogGeneration;
       const persisted = await this.#persistedInspections?.get(cwd).catch(() => undefined);
       const current = this.#inspectionCache.get(cwd);
       if (current) return current;
-      if (persisted && !this.#closePromise && !this.#inspectionInFlight.has(cwd)) {
+      if (
+        persisted &&
+        generation === this.#catalogGeneration &&
+        !this.#closePromise &&
+        !this.#inspectionInFlight.has(cwd)
+      ) {
         this.#inspectionCache.set(cwd, persisted);
         this.#thinkingSelectionSupported ??=
           persisted.capabilities.configuration.selectThinkingOption;
