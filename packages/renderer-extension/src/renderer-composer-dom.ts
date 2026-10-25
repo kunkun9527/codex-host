@@ -136,7 +136,23 @@ function isOwnedRendererControl(element: Element): boolean {
   );
 }
 
+/**
+ * Codex renders request_user_input options inside the Composer as
+ * `<button role="radio" aria-label="<option>">`, so an option such as
+ * "Submit answers" must not be mistaken for the Composer's send button.
+ */
+const CHOICE_CONTROL_ROLES = new Set([
+  "radio",
+  "checkbox",
+  "option",
+  "menuitem",
+  "menuitemradio",
+  "menuitemcheckbox",
+]);
+
 export function isComposerSubmitButton(button: HTMLButtonElement): boolean {
+  const role = typeof button.getAttribute === "function" ? button.getAttribute("role") : null;
+  if (role !== null && CHOICE_CONTROL_ROLES.has(role)) return false;
   if (button.type === "submit") return true;
   return /(^|\s)(send|submit|发送|提交)(\s|$)/u.test(buttonText(button));
 }

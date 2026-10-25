@@ -854,6 +854,21 @@ describe("Renderer Composer DOM behavior", () => {
     expect(isComposerSubmitButton(button("", "submit"))).toBe(true);
   });
 
+  it("does not treat a request_user_input option labelled Submit as the send button", () => {
+    const option = (label: string, role: string) =>
+      ({
+        type: "button",
+        getAttribute(name: string) {
+          if (name === "aria-label") return label;
+          return name === "role" ? role : null;
+        },
+      }) as HTMLButtonElement;
+
+    expect(isComposerSubmitButton(option("✓ Submit answers", "radio"))).toBe(false);
+    expect(isComposerSubmitButton(option("Send", "checkbox"))).toBe(false);
+    expect(isComposerSubmitButton(option("Send", "menuitem"))).toBe(false);
+  });
+
   it("recognizes a dictation control without treating attach or send as voice", () => {
     const button = (label: string, type = "button") =>
       ({
