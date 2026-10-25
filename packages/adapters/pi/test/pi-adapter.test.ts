@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -715,6 +715,120 @@ describe("Pi HarnessAdapter Session", () => {
         expect(transport.inspectSubagent).toHaveBeenCalledTimes(1);
       }
       await adapter.close();
+    }
+  });
+
+  it("reads a single run from its own child Session file, confined to the parent's directory", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-single-child-"));
+    const parentFile = path.join(directory, "parent.jsonl");
+    const asyncDir = path.join(directory, "runs", "run-1");
+    const childFile = path.join(directory, "parent", "run-1", "run-0", "session.jsonl");
+    const outsideFile = path.join(directory, "outside.jsonl");
+    const childSession = [
+      { type: "session", version: 3, id: "child", cwd: "/synthetic" },
+      {
+        type: "message",
+        id: "u",
+        parentId: null,
+        message: { role: "user", content: [{ type: "text", text: "Task: review the diff" }] },
+      },
+      {
+        type: "message",
+        id: "a1",
+        parentId: "u",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a" } }],
+        },
+      },
+      {
+        type: "message",
+        id: "r",
+        parentId: "a1",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-1",
+          toolName: "read",
+          content: [{ type: "text", text: "file body" }],
+          isError: false,
+        },
+      },
+      {
+        type: "message",
+        id: "a2",
+        parentId: "r",
+        message: { role: "assistant", content: [{ type: "text", text: "## Review done" }] },
+      },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join("\n");
+    const writeStatus = (sessionFile: string) =>
+      writeFile(
+        path.join(asyncDir, "status.json"),
+        JSON.stringify({
+          lifecycleArtifactVersion: 3,
+          runId: "run-1",
+          sessionId: parentFile,
+          mode: "single",
+          state: "complete",
+          steps: [{ agent: "Reviewer", status: "complete", sessionFile }],
+        }),
+      );
+    await mkdir(asyncDir, { recursive: true });
+    await mkdir(path.dirname(childFile), { recursive: true });
+    // A half-written final line of a running child is not yet part of its transcript.
+    await writeFile(childFile, `${childSession}\n{"type":"mess`);
+    await writeFile(outsideFile, `${childSession}\n`);
+    await writeStatus(childFile);
+    const { adapter, transports } = fixture();
+    try {
+      const session = await openSession(adapter);
+      await session.readSnapshot();
+      const transport = transports[0];
+      if (!transport) throw new Error("Missing transport");
+      transport.history.entries.push({
+        id: "launch",
+        parentId: transport.history.leafId,
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          toolCallId: "call",
+          isError: false,
+          details: { mode: "single", asyncId: "run-1", asyncDir, results: [] },
+        },
+      });
+      transport.history.leafId = "launch";
+      const request = {
+        parent: nativeSessionRefSchema.parse({
+          harnessId: "pi",
+          nativeSessionId: "pi-session-1",
+          formatVersion: 1,
+          locator: { sessionFile: parentFile },
+        }),
+        nativeSubagentId: piSubagentId({ runId: "run-1" }),
+        cwd: "/synthetic",
+      };
+      const result = await adapter.subagents.readSnapshot(request);
+      expect(result).toMatchObject({
+        ok: true,
+        value: { turns: [{ input: [{ type: "text", text: "Task: review the diff" }] }] },
+      });
+      const items = result.ok ? (result.value.turns[0]?.items ?? []) : [];
+      expect(items.map(({ item }) => item.type)).toContain("toolExecution");
+      expect(items.at(-1)?.item).toMatchObject({ type: "agentMessage", text: "## Review done" });
+      expect(transport.inspectSubagent).not.toHaveBeenCalled();
+
+      await writeStatus(outsideFile);
+      const confined = await adapter.subagents.readSnapshot(request);
+      expect(confined).toMatchObject({
+        ok: true,
+        value: { turns: [{ items: [{ item: { text: "child answer" } }] }] },
+      });
+      expect(transport.inspectSubagent).toHaveBeenCalled();
+    } finally {
+      await adapter.close();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 

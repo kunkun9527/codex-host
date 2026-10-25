@@ -67,6 +67,71 @@ export function piSubagentArtifact(
   });
 }
 
+const MAX_STATUS_BYTES = 1024 * 1024;
+
+async function readStatusArtifact(directory: string): Promise<unknown> {
+  const file = await open(
+    path.join(directory, "status.json"),
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size > MAX_STATUS_BYTES) return undefined;
+    const buffer = Buffer.alloc(MAX_STATUS_BYTES + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_STATUS_BYTES) return undefined;
+    return JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+  } finally {
+    await file.close();
+  }
+}
+
+/**
+ * The child Session file of a single async run, resolved from the parent's own launch receipt
+ * and the run's status.json. pi-subagents stores child Sessions under the parent Session file's
+ * sibling directory; anything outside it is refused, so a status file cannot redirect reads.
+ */
+export async function piSingleSubagentSessionFile(
+  history: PiSessionHistory,
+  runId: string,
+  parentSessionId: string,
+  parentSessionFile: string,
+): Promise<string | null> {
+  const receipt = activePiEntries(history).findLast(
+    ({ message }) =>
+      record(message) &&
+      message.role === "toolResult" &&
+      message.toolName === "subagent" &&
+      record(message.details) &&
+      message.details.mode === "single" &&
+      message.details.asyncId === runId,
+  )?.message;
+  const directory = record(receipt) && record(receipt.details) ? receipt.details.asyncDir : null;
+  if (
+    typeof directory !== "string" ||
+    !path.isAbsolute(directory) ||
+    path.basename(directory) !== runId ||
+    !path.isAbsolute(parentSessionFile) ||
+    path.extname(parentSessionFile) !== ".jsonl"
+  )
+    return null;
+  const value = await readStatusArtifact(directory);
+  if (
+    !record(value) ||
+    value.lifecycleArtifactVersion !== 3 ||
+    value.runId !== runId ||
+    value.mode !== "single" ||
+    (value.sessionId !== parentSessionId && value.sessionId !== parentSessionFile)
+  )
+    return null;
+  const step = Array.isArray(value.steps) && record(value.steps[0]) ? value.steps[0] : {};
+  const file = step.sessionFile ?? value.sessionFile;
+  if (typeof file !== "string" || !path.isAbsolute(file)) return null;
+  const root = parentSessionFile.slice(0, -".jsonl".length);
+  const relative = path.relative(root, file);
+  return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? file : null;
+}
+
 /** Restored cards use parent-owned native receipts, never arbitrary filesystem paths supplied by the UI. */
 export async function restorePiSubagents(
   history: PiSessionHistory,
@@ -96,24 +161,11 @@ export async function restorePiSubagents(
   }
   // Bound history I/O. Missing, pruned, foreign and future-version artifacts remain ordinary tools.
   for (const [id, directory] of [...receipts].slice(-128)) {
-    let file: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      file = await open(
-        path.join(directory, "status.json"),
-        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-      );
-      const stat = await file.stat();
-      if (!stat.isFile() || stat.size > 1024 * 1024) continue;
-      const buffer = Buffer.alloc(1024 * 1024 + 1);
-      const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-      if (bytesRead > 1024 * 1024) continue;
-      const value: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
-      const runs = piSubagentArtifact(value, id, owners);
+      const runs = piSubagentArtifact(await readStatusArtifact(directory), id, owners);
       if (runs) observer.restore(runs);
     } catch {
       // Artifact retention and status publication races are not parent Session failures.
-    } finally {
-      await file?.close();
     }
   }
 }
