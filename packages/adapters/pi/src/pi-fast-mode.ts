@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 
 import type { HarnessModelCatalog } from "@codexhost/shared-contracts";
+import { codexhostDataDirectory } from "./pi-inspection-cache.js";
 import { decodePiModelRef, encodePiModelRef, type PiNativeModel } from "./pi-model-catalog.js";
 
 export const PI_FAST_COMMAND = "codexhost-fast-mode";
@@ -60,10 +60,11 @@ export const PI_FAST_EXTENSION = `export default function(pi) {
 /** Content-addressed Host resource: concurrent starts and installed plugin versions cannot race. */
 export async function ensurePiFastExtension(environment: NodeJS.ProcessEnv): Promise<string> {
   const digest = createHash("sha256").update(PI_FAST_EXTENSION).digest("hex").slice(0, 16);
-  const dataDirectory =
-    environment.CODEXHOST_DATA_DIR ??
-    path.join(environment.HOME ?? environment.USERPROFILE ?? homedir(), ".codexhost");
-  const directory = path.resolve(dataDirectory, "extensions", "pi-codex-fast");
+  const directory = path.resolve(
+    codexhostDataDirectory(environment),
+    "extensions",
+    "pi-codex-fast",
+  );
   const file = path.join(directory, `${digest}.mjs`);
   if ((await readFile(file, "utf8").catch(() => "")) === PI_FAST_EXTENSION) return file;
   await mkdir(directory, { recursive: true });
