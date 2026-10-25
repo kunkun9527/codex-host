@@ -137,22 +137,30 @@ function isOwnedRendererControl(element: Element): boolean {
 }
 
 /**
- * Codex renders request_user_input options inside the Composer as
- * `<button role="radio" aria-label="<option>">`, so an option such as
- * "Submit answers" must not be mistaken for the Composer's send button.
+ * Codex renders tool request cards (request_user_input, approvals) inside the
+ * Composer root and marks them with these attributes; Codex's own Composer
+ * input handling excludes them too. Their buttons and editors belong to the
+ * request, never to the Composer prompt: an option labelled "Submit answers"
+ * is not the send button, and answering must not wait on Harness state.
  */
-const CHOICE_CONTROL_ROLES = new Set([
-  "radio",
-  "checkbox",
-  "option",
-  "menuitem",
-  "menuitemradio",
-  "menuitemcheckbox",
-]);
+export const CODEX_COMPOSER_REQUEST_SELECTOR =
+  "[data-codex-composer-request], [data-codex-composer-request-navigation]";
+
+export function isInsideComposerRequest(element: Element): boolean {
+  return (
+    typeof element.closest === "function" &&
+    element.closest(CODEX_COMPOSER_REQUEST_SELECTOR) !== null
+  );
+}
+
+/** Buttons of the Composer itself, excluding any request card it hosts. */
+export function composerOwnButtons(root: Element): HTMLButtonElement[] {
+  return [...root.querySelectorAll<HTMLButtonElement>("button")].filter(
+    (button) => !isInsideComposerRequest(button),
+  );
+}
 
 export function isComposerSubmitButton(button: HTMLButtonElement): boolean {
-  const role = typeof button.getAttribute === "function" ? button.getAttribute("role") : null;
-  if (role !== null && CHOICE_CONTROL_ROLES.has(role)) return false;
   if (button.type === "submit") return true;
   return /(^|\s)(send|submit|发送|提交)(\s|$)/u.test(buttonText(button));
 }
@@ -187,11 +195,7 @@ function isTrailingActionNode(element: Element): boolean {
 }
 
 export function sendButtonWithin(root: Element): HTMLButtonElement | null {
-  return (
-    [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
-      isComposerSubmitButton(button),
-    ) ?? null
-  );
+  return composerOwnButtons(root).find((button) => isComposerSubmitButton(button)) ?? null;
 }
 
 function leftmostTrailingSibling(container: Element, before: Element): HTMLElement | null {
@@ -240,6 +244,7 @@ export function composerForEditor(editor: Element): Element | null {
 }
 
 export function composerForElement(element: Element): Element | null {
+  if (isInsideComposerRequest(element)) return null;
   const composer = element.closest(CODEX_COMPOSER_SELECTOR);
   return composer && !isOrbitComposer(composer) ? composer : null;
 }
@@ -412,8 +417,7 @@ export function inspectRendererComposerContract(
     const editors = [...composer.querySelectorAll<HTMLElement>(EDITOR_SELECTOR)].filter(
       contractElementVisible,
     );
-    const allButtons = [...composer.querySelectorAll<HTMLButtonElement>("button")];
-    const sendButton = sendButtonWithin(composer) ?? allButtons.at(-1) ?? null;
+    const sendButton = sendButtonWithin(composer) ?? composerOwnButtons(composer).at(-1) ?? null;
     if (editors.length === 1 && sendButton !== null) result.activeComposerCount += 1;
     if (sendButton) {
       result.sendButtonCount += 1;
@@ -518,7 +522,7 @@ export function creditsPlacementAnchor(control: ComposerAgentControl): HTMLEleme
  * the Composer also contains our own controls, so skip their buttons.
  */
 function lastNativeButtonWithin(composer: Element): HTMLButtonElement | null {
-  const buttons = [...composer.querySelectorAll<HTMLButtonElement>("button")];
+  const buttons = composerOwnButtons(composer);
   for (let index = buttons.length - 1; index >= 0; index -= 1) {
     const button = buttons[index];
     if (button && !isInsideOwnedRendererControl(button, composer)) return button;

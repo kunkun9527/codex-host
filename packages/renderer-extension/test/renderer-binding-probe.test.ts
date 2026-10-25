@@ -39,6 +39,11 @@ import {
   isComposerInputIntent,
   isComposerSubmissionKey,
   isComposerSubmitButton,
+  CODEX_COMPOSER_REQUEST_SELECTOR,
+  CODEX_COMPOSER_SELECTOR,
+  composerForElement,
+  composerOwnButtons,
+  sendButtonWithin,
   isComposerVoiceButton,
   creditsPlacementAnchor,
   isNativeContextUsageControlCandidate,
@@ -854,19 +859,31 @@ describe("Renderer Composer DOM behavior", () => {
     expect(isComposerSubmitButton(button("", "submit"))).toBe(true);
   });
 
-  it("does not treat a request_user_input option labelled Submit as the send button", () => {
-    const option = (label: string, role: string) =>
+  it("leaves buttons and editors of a request card hosted by the Composer to Codex", () => {
+    const composerRoot = { querySelector: () => null, parentElement: null };
+    const node = (label: string, insideRequest: boolean) =>
       ({
         type: "button",
-        getAttribute(name: string) {
-          if (name === "aria-label") return label;
-          return name === "role" ? role : null;
+        getAttribute: (name: string) => (name === "aria-label" ? label : null),
+        closest: (selector: string) => {
+          if (selector === CODEX_COMPOSER_REQUEST_SELECTOR) return insideRequest ? {} : null;
+          return selector === CODEX_COMPOSER_SELECTOR ? composerRoot : null;
         },
-      }) as HTMLButtonElement;
+        hasAttribute: () => false,
+      }) as unknown as HTMLButtonElement;
+    // Codex renders request_user_input options as <button role="radio" aria-label="…">.
+    const submitAnswers = node("✓ Submit answers", true);
+    const skip = node("跳过", true);
+    const send = node("Send", false);
+    const attach = node("Attach files", false);
+    const composer = (buttons: HTMLButtonElement[]) =>
+      ({ querySelectorAll: () => buttons }) as unknown as Element;
 
-    expect(isComposerSubmitButton(option("✓ Submit answers", "radio"))).toBe(false);
-    expect(isComposerSubmitButton(option("Send", "checkbox"))).toBe(false);
-    expect(isComposerSubmitButton(option("Send", "menuitem"))).toBe(false);
+    expect(sendButtonWithin(composer([submitAnswers, send]))).toBe(send);
+    expect(sendButtonWithin(composer([submitAnswers, skip]))).toBeNull();
+    expect(composerOwnButtons(composer([attach, submitAnswers, skip]))).toEqual([attach]);
+    expect(composerForElement(submitAnswers)).toBeNull();
+    expect(composerForElement(send)).toBe(composerRoot);
   });
 
   it("recognizes a dictation control without treating attach or send as voice", () => {

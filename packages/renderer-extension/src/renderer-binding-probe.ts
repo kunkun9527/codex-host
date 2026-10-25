@@ -35,6 +35,7 @@ import {
   EDITOR_SELECTOR,
   composerForEditor,
   composerForElement,
+  composerOwnButtons,
   disposeComposerAgentControl,
   refreshSendButton,
   editorForElement,
@@ -2668,8 +2669,7 @@ export function installRendererBindingProbe(
     ) {
       return;
     }
-    const allButtons = [...composer.querySelectorAll<HTMLButtonElement>("button")];
-    const sendButton = sendButtonWithin(composer) ?? allButtons.at(-1) ?? null;
+    const sendButton = sendButtonWithin(composer) ?? composerOwnButtons(composer).at(-1) ?? null;
     if (!sendButton) return;
     const modelTarget = findComposerModelTarget(composer);
     const hostId = activeModelHostId(composer);
