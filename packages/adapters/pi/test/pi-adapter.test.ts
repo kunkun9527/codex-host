@@ -1215,6 +1215,65 @@ describe("Pi HarnessAdapter Session", () => {
     await adapter.close();
   });
 
+  it("extends the history read while opening for the first snapshot instead of reading Pi in full", async () => {
+    for (const sinceFails of [false, true]) {
+      const { adapter, dependencies, transports } = fixture();
+      const getEntriesSince = vi.fn(async (entryId: string): Promise<PiSessionHistory> => {
+        const transport = transports[0] as FakePiTransport;
+        if (sinceFails) throw new Error(`Entry not found: ${entryId}`);
+        const index = transport.history.entries.findIndex((entry) => entry.id === entryId);
+        return {
+          entries: structuredClone(transport.history.entries.slice(index + 1)),
+          leafId: transport.history.leafId,
+        };
+      });
+      vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+        const transport = Object.assign(new FakePiTransport(), { getEntriesSince });
+        transport.options = options;
+        transport.state = {
+          ...transport.state,
+          sessionId: "source-session",
+          sessionFile: "/synthetic/source.jsonl",
+        };
+        transport.history = sourceHistory(1);
+        transports.push(transport);
+        return transport;
+      });
+      const nativeRef = nativeSessionRefSchema.parse({
+        harnessId: "pi",
+        nativeSessionId: "source-session",
+        locator: { sessionFile: "/synthetic/source.jsonl" },
+        formatVersion: 1,
+      });
+
+      const opened = await adapter.open({ kind: "resume", cwd: "/synthetic", nativeRef });
+      if (!opened.ok) throw new Error(opened.error.message);
+      const transport = transports[0] as FakePiTransport;
+      expect(transport.getEntries).toHaveBeenCalledOnce();
+      // Pi appended a Turn between opening and the first snapshot.
+      transport.history = sourceHistory(2);
+      const turns = [
+        { nativeTurnRef: { nativeTurnKey: "source-user-1" } },
+        { nativeTurnRef: { nativeTurnKey: "source-user-2" } },
+      ];
+      await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+        ok: true,
+        value: { turns },
+      });
+      expect(getEntriesSince).toHaveBeenCalledExactlyOnceWith("source-assistant-1");
+      expect(transport.getEntries).toHaveBeenCalledTimes(sinceFails ? 2 : 1);
+
+      await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+        ok: true,
+        value: { turns },
+      });
+      expect(getEntriesSince).toHaveBeenCalledOnce();
+      expect(transport.getEntries).toHaveBeenCalledTimes(sinceFails ? 3 : 2);
+      await opened.value.close();
+      await adapter.close();
+    }
+  });
+
   it("resumes an import-discovered locator, projects history, and continues the same native session", async () => {
     const cwd = await realpath(
       await mkdtemp(path.join(os.tmpdir(), "codexhost-pi-import-resume-")),

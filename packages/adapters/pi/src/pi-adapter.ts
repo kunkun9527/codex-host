@@ -162,6 +162,8 @@ export interface PiTurnTransport {
   getAvailableModels(): Promise<PiNativeModel[]>;
   getAvailableThinkingLevels(): Promise<HarnessThinkingOptionId[] | null>;
   getEntries(): Promise<PiSessionHistory>;
+  /** Entries appended after `entryId`, with the current leaf; rejects when Pi lacks that entry. */
+  getEntriesSince?(entryId: string): Promise<PiSessionHistory>;
   /** Live commands of the running Session; absent on transports without RPC listing. */
   getCommands?(): Promise<PiNativeCommand[]>;
   getSessionUsage(): Promise<HostUsage | null>;
@@ -465,6 +467,8 @@ class PiHarnessSession implements HarnessSession {
   readonly outputs: AsyncIterable<HarnessOutput>;
   readonly #channel = new HarnessOutputChannel<HarnessOutput>();
   readonly #subagents = new PiSubagents((event) => this.#event(event), piSubagentReceiptRuns);
+  /** History read while opening; the first snapshot extends it instead of reading Pi in full. */
+  #openedHistory: { transport: PiTurnTransport; history: PiSessionHistory } | null = null;
   #pendingSubagentStatus: PiSubagentNode[] | null = null;
   readonly #closeTimeoutMs: number;
   readonly #createTransport: PiAdapterDependencies["createTransport"];
@@ -525,6 +529,7 @@ class PiHarnessSession implements HarnessSession {
       startedThinkingLevels?: HarnessThinkingOptionId[] | null;
       initialUsage?: HostUsage | null;
       usageHistory?: { requests: HostUsageRequest[]; complete: boolean };
+      openedHistory?: PiSessionHistory;
     },
   ) {
     this.#cwd = cwd;
@@ -556,6 +561,12 @@ class PiHarnessSession implements HarnessSession {
       execute: (command) => this.#executeHarnessCommand(command),
     };
     this.#transport = options.startedTransport ?? null;
+    if (options.startedTransport && options.openedHistory) {
+      this.#openedHistory = {
+        transport: options.startedTransport,
+        history: options.openedHistory,
+      };
+    }
     this.initialState = options.startedTransport
       ? harnessStateFromPi(options.startedTransport.state, options.startedThinkingLevels ?? null)
       : {};
@@ -619,7 +630,7 @@ class PiHarnessSession implements HarnessSession {
     }
     try {
       const transport = await this.#ensureTransport();
-      const history = await transport.getEntries();
+      const history = await this.#readHistory(transport);
       const owners = [transport.state.sessionId, transport.state.sessionFile];
       await restorePiSubagents(
         history,
@@ -646,6 +657,27 @@ class PiHarnessSession implements HarnessSession {
     }
   }
 
+  /**
+   * Pi entries are append-only, so the history read while opening plus the entries appended
+   * since is the full history. Any doubt (another transport, a missing entry, no `since`
+   * support) reads it in full.
+   */
+  async #readHistory(transport: PiTurnTransport): Promise<PiSessionHistory> {
+    const opened = this.#openedHistory;
+    this.#openedHistory = null;
+    const lastEntryId = opened?.history.entries.at(-1)?.id;
+    if (opened?.transport === transport && typeof lastEntryId === "string") {
+      const appended = await transport.getEntriesSince?.(lastEntryId).catch(() => undefined);
+      if (appended) {
+        return {
+          entries: [...opened.history.entries, ...appended.entries],
+          leafId: appended.leafId,
+        };
+      }
+    }
+    return transport.getEntries();
+  }
+
   execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
   execute(command: TurnSteerCommand): Promise<HarnessResult<TurnSteerAccepted>>;
   execute(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>>;
@@ -668,6 +700,8 @@ class PiHarnessSession implements HarnessSession {
       | PermissionModeSelectCompleted
     >
   > {
+    // A Session driven without a snapshot read must not keep its opening history alive.
+    this.#openedHistory = null;
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Pi Session is not open") };
     }
@@ -812,6 +846,7 @@ class PiHarnessSession implements HarnessSession {
   }
 
   close(): Promise<void> {
+    this.#openedHistory = null;
     if (!this.#closePromise) {
       this.#closePromise = this.#close().finally(this.#onClosed);
     }
@@ -2542,12 +2577,17 @@ export class PiAdapter implements HarnessAdapter {
       const startedThinkingLevels = await transport.getAvailableThinkingLevels();
       this.#thinkingSelectionSupported = startedThinkingLevels !== null;
       const initialUsage = await transport.getSessionUsage().catch(() => null);
+      let openedHistory: PiSessionHistory | undefined;
       const usageHistory = await transport
         .getEntries()
-        .then(piUsageHistory)
+        .then((history) => {
+          openedHistory = history;
+          return piUsageHistory(history);
+        })
         .catch(() => ({ requests: [], complete: false }));
       session = this.#trackSession(input.cwd, {
         usageHistory,
+        ...(openedHistory ? { openedHistory } : {}),
         ...(input.environment ? { environment: input.environment } : {}),
         startedTransport: transport,
         startedThinkingLevels,
@@ -2580,6 +2620,7 @@ export class PiAdapter implements HarnessAdapter {
       startedThinkingLevels?: HarnessThinkingOptionId[] | null;
       initialUsage?: HostUsage | null;
       usageHistory?: { requests: HostUsageRequest[]; complete: boolean };
+      openedHistory?: PiSessionHistory;
     },
   ): PiHarnessSession {
     const environment = options.environment;
@@ -2612,6 +2653,7 @@ export class PiAdapter implements HarnessAdapter {
           : {}),
         ...(options.initialUsage !== undefined ? { initialUsage: options.initialUsage } : {}),
         ...(options.usageHistory ? { usageHistory: options.usageHistory } : {}),
+        ...(options.openedHistory ? { openedHistory: options.openedHistory } : {}),
       },
     );
     this.#sessions.add(session);

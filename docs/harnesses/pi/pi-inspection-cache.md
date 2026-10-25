@@ -11,6 +11,13 @@ Pi 的 `inspect()` 要起一个完整的 Pi RPC 进程（加载全部 Pi 扩展�
 - 文件缺失、损坏或条目不通过 `harnessInspectionSchema` 校验时按空缓存处理，不报错。
 - 不传 `inspectionCacheFile`（测试、直接构造 Adapter）时只用内存缓存，行为与以前相同。
 
+## 打开会话时只完整读一次历史
+
+恢复会话时，`open()` 已经为用量统计读过一次完整的 `get_entries`。Session 留住这份历史，第一次 `readSnapshot()` 只用 `get_entries { since: <最后一条 Entry id> }` 取之后追加的条目再拼上，不再让 Pi 整份回传一次（2.4 MB 的会话约省 0.7 秒，越大越多）。Pi 的 Entry 只追加，所以拼出的就是完整历史。
+
+- 只用一次：第一次快照读取后、任意 Host 命令（`execute`）或关闭时丢弃，不长期占内存。
+- 换了 transport、`since` 指向的条目不存在（Pi 报 `Entry not found`，命令错误不会让 Session 故障），或 transport 不支持 `getEntriesSince` 时，退回完整读取。
+
 ## 代价
 
 新增或删除 Pi 的 Provider/Model 后，Host 重启后的头 30 秒左右模型列表可能还是上次的，重检完成后更新；需要立即生效时用「重新检测」。
