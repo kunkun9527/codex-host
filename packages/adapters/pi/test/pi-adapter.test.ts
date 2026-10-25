@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -819,13 +819,19 @@ describe("Pi HarnessAdapter Session", () => {
       expect(items.at(-1)?.item).toMatchObject({ type: "agentMessage", text: "## Review done" });
       expect(transport.inspectSubagent).not.toHaveBeenCalled();
 
-      await writeStatus(outsideFile);
-      const confined = await adapter.subagents.readSnapshot(request);
-      expect(confined).toMatchObject({
-        ok: true,
-        value: { turns: [{ items: [{ item: { text: "child answer" } }] }] },
-      });
-      expect(transport.inspectSubagent).toHaveBeenCalled();
+      // Neither a lexical escape nor a link inside the root may reach a Session outside it.
+      const linked = path.join(directory, "parent", "linked");
+      await symlink(directory, linked, "junction");
+      for (const escaped of [outsideFile, path.join(linked, "outside.jsonl")]) {
+        transport.inspectSubagent.mockClear();
+        await writeStatus(escaped);
+        const confined = await adapter.subagents.readSnapshot(request);
+        expect(confined).toMatchObject({
+          ok: true,
+          value: { turns: [{ items: [{ item: { text: "child answer" } }] }] },
+        });
+        expect(transport.inspectSubagent).toHaveBeenCalled();
+      }
     } finally {
       await adapter.close();
       await rm(directory, { recursive: true, force: true });

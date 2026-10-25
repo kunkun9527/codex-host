@@ -1,5 +1,5 @@
 import { constants, readFileSync, statSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { open, realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { activePiEntries, type PiSessionHistory } from "./pi-history.js";
@@ -127,9 +127,13 @@ export async function piSingleSubagentSessionFile(
   const step = Array.isArray(value.steps) && record(value.steps[0]) ? value.steps[0] : {};
   const file = step.sessionFile ?? value.sessionFile;
   if (typeof file !== "string" || !path.isAbsolute(file)) return null;
-  const root = parentSessionFile.slice(0, -".jsonl".length);
-  const relative = path.relative(root, file);
-  return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? file : null;
+  // Compare resolved paths so a symlinked or junctioned directory cannot lead outside the root.
+  const [root, target] = await Promise.all([
+    realpath(parentSessionFile.slice(0, -".jsonl".length)),
+    realpath(file),
+  ]);
+  const relative = path.relative(root, target);
+  return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? target : null;
 }
 
 /** Restored cards use parent-owned native receipts, never arbitrary filesystem paths supplied by the UI. */
