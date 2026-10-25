@@ -18,7 +18,8 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 const MAX_SESSION_BYTES = 8 * 1024 * 1024;
 
-async function childHistory(
+/** Project a child's own Pi Session file as read-only Host turns. */
+export async function readPiChildSession(
   file: string,
   parentSessionId: string,
   identity: string,
@@ -35,9 +36,10 @@ async function childHistory(
     const buffer = Buffer.alloc(MAX_SESSION_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead > MAX_SESSION_BYTES) throw new Error("Pi child Session exceeds read bounds");
-    const values: unknown[] = buffer
-      .subarray(0, bytesRead)
-      .toString("utf8")
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    // A running child may be mid-append; its last line is complete only once newline-terminated.
+    const values: unknown[] = text
+      .slice(0, text.lastIndexOf("\n") + 1)
       .split("\n")
       .filter((line) => line.trim())
       .map((line) => JSON.parse(line));
@@ -109,7 +111,7 @@ export async function readPiWorkflowChild(
     const id = piWorkflowSubagentId(address);
     if (typeof result.sessionFile === "string") {
       try {
-        const snapshot = await childHistory(result.sessionFile, parentSessionId, id);
+        const snapshot = await readPiChildSession(result.sessionFile, parentSessionId, id);
         if (snapshot.turns.length) return { ok: true, value: snapshot };
       } catch {
         // Pruned, partial, oversized and unsupported transcripts can still have a saved final result.

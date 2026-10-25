@@ -94,8 +94,12 @@ import {
   type PiSubagentNode,
 } from "./pi-subagents.js";
 import { parsePiWorkflowSubagentId } from "./pi-subagent-workflow.js";
-import { readPiWorkflowChild } from "./pi-workflow-child-history.js";
-import { piSubagentReceiptRuns, restorePiSubagents } from "./pi-subagent-history.js";
+import { readPiChildSession, readPiWorkflowChild } from "./pi-workflow-child-history.js";
+import {
+  piSingleSubagentSessionFile,
+  piSubagentReceiptRuns,
+  restorePiSubagents,
+} from "./pi-subagent-history.js";
 import { rollbackPiLastTurn } from "./pi-last-turn-rollback.js";
 import { PiSessionImportIndex } from "./pi-session-import.js";
 import { SessionImportScope } from "@codexhost/harness-adapter/session-import";
@@ -2098,6 +2102,26 @@ export class PiAdapter implements HarnessAdapter {
           readHistory = () => started.getEntries();
           inspect = (queryChildId) => inspectStarted(nativeSubagentId, queryChildId);
         }
+        let history: PiSessionHistory | undefined;
+        const parentHistory = async () => (history ??= await readHistory());
+        if (address && !address.childId) {
+          // The child's own Session file keeps the task and real tool items; the inspection RPC
+          // only returns a bounded plain-text window, so it is the fallback.
+          try {
+            const file = await piSingleSubagentSessionFile(
+              await parentHistory(),
+              address.runId,
+              parent.nativeSessionId,
+              sessionFileFromRef(parent),
+            );
+            const snapshot = file
+              ? await readPiChildSession(file, parent.nativeSessionId, nativeSubagentId)
+              : null;
+            if (snapshot?.turns.length) return { ok: true, value: snapshot };
+          } catch {
+            // Pruned, oversized or unsupported child Sessions still have the inspection window.
+          }
+        }
         reply = await inspect();
         // A running single run publishes its transcript only on steps[0]; the root sessionFile is
         // written at finalization (pi-subagents docs/observability.md). Its step is the same worker.
@@ -2106,7 +2130,7 @@ export class PiAdapter implements HarnessAdapter {
           !reply.messages?.length &&
           address &&
           !address.childId &&
-          piSingleAsyncRun(await readHistory(), address.runId)
+          piSingleAsyncRun(await parentHistory(), address.runId)
         ) {
           const step = await inspect("step:0");
           if (!step.error && step.messages?.length) reply = step;
@@ -2164,6 +2188,7 @@ export class PiAdapter implements HarnessAdapter {
   readonly #persistedInspections: PiInspectionCache | null;
   readonly #inspectionRevalidateDelayMs: number;
   readonly #revalidations = new Map<string, ReturnType<typeof setTimeout>>();
+  #catalogGeneration = 0;
   readonly #inspections = new Set<PiTurnTransport>();
   readonly #sessions = new Set<PiHarnessSession>();
   readonly #toolOutputLimit: number;
@@ -2180,6 +2205,9 @@ export class PiAdapter implements HarnessAdapter {
     const imports = createPiCredentialImports(options);
     const updateCatalog = async (operation: Promise<void>): Promise<void> => {
       await operation;
+      // Inspections started before the change must neither be joined nor stored.
+      this.#catalogGeneration += 1;
+      this.#inspectionInFlight.clear();
       this.#inspectionCache.clear();
       await this.#persistedInspections?.clear().catch(() => undefined);
     };
@@ -2188,7 +2216,6 @@ export class PiAdapter implements HarnessAdapter {
       list: () => imports.list(),
       listOthers: () => imports.listOthers?.() ?? Promise.resolve([]),
       add: (name, credential) => updateCatalog(imports.add(name, credential)),
-  #catalogGeneration = 0;
       reimport: (name, credential) => updateCatalog(imports.reimport(name, credential)),
       remove: (name) => updateCatalog(imports.remove(name)),
     };
@@ -2205,9 +2232,6 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   /** Pi itself holds no Account; this reports configured Provider balances. */
-      // Inspections started before the change must neither be joined nor stored.
-      this.#catalogGeneration += 1;
-      this.#inspectionInFlight.clear();
   async inspectAccounts() {
     if (this.#closePromise) return [];
     return fetchPiAccounts({ environment: this.#environment });
@@ -2264,7 +2288,9 @@ export class PiAdapter implements HarnessAdapter {
   #runInspection(cwd: string): Promise<HarnessInspection> {
     const inFlight = this.#inspectionInFlight.get(cwd);
     if (inFlight) return inFlight;
+    const generation = this.#catalogGeneration;
     const inspection = this.#inspectCwd(cwd).then(async (result) => {
+      if (generation !== this.#catalogGeneration) return result;
       if (result.status === "ready") {
         this.#inspectionCache.set(cwd, result);
         await this.#persistedInspections?.set(cwd, result).catch(() => undefined);
@@ -2288,9 +2314,7 @@ export class PiAdapter implements HarnessAdapter {
     const transport = this.#createTransport({ cwd, onFault: () => undefined });
     this.#inspections.add(transport);
     try {
-    const generation = this.#catalogGeneration;
       stage = "startup";
-      if (generation !== this.#catalogGeneration) return result;
       await transport.start();
       stage = "model-catalog";
       const models = await transport.getAvailableModels();
