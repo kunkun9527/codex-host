@@ -775,8 +775,15 @@ export class PiRpcSession {
   }
 
   async getEntries(): Promise<PiSessionHistory> {
+    return this.getEntriesSince(undefined);
+  }
+
+  /** Pi answers an unknown `since` with a command error, which rejects without a fault. */
+  async getEntriesSince(entryId: string | undefined): Promise<PiSessionHistory> {
     try {
-      return parseSessionHistory(await this.#send("get_entries", {}));
+      return parseSessionHistory(
+        await this.#send("get_entries", entryId === undefined ? {} : { since: entryId }),
+      );
     } catch (error) {
       if (error instanceof PiRpcFaultError) this.#fail(error);
       throw error;
