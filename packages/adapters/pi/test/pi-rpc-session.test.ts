@@ -391,8 +391,21 @@ class FakePiRpcProcess extends EventEmitter {
           usage: { input: 1, output: 1, cacheRead: 999, cacheWrite: 0 },
         },
       };
+      const entries = this.#scenario === "stats-cache-hit" ? [user, assistant] : [user];
+      const sinceIndex =
+        command.since === undefined ? -1 : entries.findIndex((entry) => entry.id === command.since);
+      if (command.since !== undefined && sinceIndex < 0) {
+        this.#output({
+          id: command.id,
+          type: "response",
+          command: command.type,
+          success: false,
+          error: `Entry not found: ${String(command.since)}`,
+        });
+        return;
+      }
       this.#respond(command, {
-        entries: this.#scenario === "stats-cache-hit" ? [user, assistant] : [user],
+        entries: entries.slice(sinceIndex + 1),
         leafId: this.#scenario === "stats-cache-hit" ? "assistant-1" : "user-1",
       });
       return;
@@ -1552,6 +1565,10 @@ describe("Pi RPC Turn aggregation", () => {
       entries: [expect.objectContaining({ id: "user-1", type: "message" })],
       leafId: "user-1",
     });
+    await expect(rpc.getEntriesSince("user-1")).resolves.toEqual({ entries: [], leafId: "user-1" });
+    // An unknown cursor is a command error, not a Session fault.
+    await expect(rpc.getEntriesSince("missing")).rejects.toThrow("Entry not found: missing");
+    await expect(rpc.getEntries()).resolves.toMatchObject({ leafId: "user-1" });
     await expect(rpc.fork("user-1")).resolves.toMatchObject({
       sessionId: "synthetic-session-derived",
     });
