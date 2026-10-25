@@ -2188,6 +2188,7 @@ export class PiAdapter implements HarnessAdapter {
       list: () => imports.list(),
       listOthers: () => imports.listOthers?.() ?? Promise.resolve([]),
       add: (name, credential) => updateCatalog(imports.add(name, credential)),
+  #catalogGeneration = 0;
       reimport: (name, credential) => updateCatalog(imports.reimport(name, credential)),
       remove: (name) => updateCatalog(imports.remove(name)),
     };
@@ -2204,6 +2205,9 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   /** Pi itself holds no Account; this reports configured Provider balances. */
+      // Inspections started before the change must neither be joined nor stored.
+      this.#catalogGeneration += 1;
+      this.#inspectionInFlight.clear();
   async inspectAccounts() {
     if (this.#closePromise) return [];
     return fetchPiAccounts({ environment: this.#environment });
@@ -2284,7 +2288,9 @@ export class PiAdapter implements HarnessAdapter {
     const transport = this.#createTransport({ cwd, onFault: () => undefined });
     this.#inspections.add(transport);
     try {
+    const generation = this.#catalogGeneration;
       stage = "startup";
+      if (generation !== this.#catalogGeneration) return result;
       await transport.start();
       stage = "model-catalog";
       const models = await transport.getAvailableModels();
