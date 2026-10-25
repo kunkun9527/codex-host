@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PiSessionHistory } from "../src/pi-history.js";
 
 import {
+  PiRpcCommandRejectedError,
   PiRpcSession,
   piRpcProcessCommand,
   type PiAutonomousTurn,
@@ -58,6 +59,9 @@ type Scenario =
   | "stats-timeout"
   | "stats-late"
   | "model-late"
+  | "steer"
+  | "steer-stranded"
+  | "steer-rejected"
   | "chunked-output"
   | "missing-session-id";
 
@@ -74,6 +78,7 @@ class FakePiRpcProcess extends EventEmitter {
   #sessionId = "synthetic-session";
   #sessionFile: string | null = "/synthetic/session.jsonl";
   #stateRequestCount = 0;
+  #pendingSteers: string[] = [];
   #isStreaming = false;
   #provider = "synthetic-provider";
   #modelId = "synthetic-model";
@@ -310,8 +315,16 @@ class FakePiRpcProcess extends EventEmitter {
         },
         thinkingLevel: this.#thinkingLevel,
         isStreaming: this.#isStreaming,
+        pendingMessageCount: this.#pendingSteers.length,
         contextUsage: { tokens: 45, contextWindow: 200 },
       });
+      return;
+    }
+    if (
+      this.#scenario.startsWith("steer") &&
+      ["prompt", "steer", "clear_queue"].includes(command.type)
+    ) {
+      this.#steerScenario(command);
       return;
     }
     if (command.type === "get_session_stats") {
@@ -824,6 +837,68 @@ class FakePiRpcProcess extends EventEmitter {
       responseId: "after-tools",
       content: [{ type: "text", text: "tools complete" }],
     };
+    this.#output({ type: "message_start", message });
+    this.#output({ type: "message_end", message });
+    this.#settleAgent();
+  }
+
+  /** One run blocked in a tool until steered; `steer-stranded` misses Pi's last queue poll. */
+  #steerScenario(command: Record<string, unknown>): void {
+    if (command.type === "prompt") {
+      this.#isStreaming = true;
+      this.#promptCount += 1;
+      this.#respond(command, { disposition: "started" });
+      if (this.#promptCount > 1) {
+        this.#answerSteer(String(command.message));
+        return;
+      }
+      const message = { role: "assistant", content: [{ type: "text", text: "working" }] };
+      this.#output({ type: "message_start", message });
+      this.#output({ type: "message_end", message });
+      this.#output({
+        type: "tool_execution_start",
+        toolCallId: "steer-tool",
+        toolName: "bash",
+        args: {},
+      });
+      return;
+    }
+    if (command.type === "clear_queue") {
+      this.#respond(command, { steering: this.#pendingSteers, followUp: [] });
+      this.#pendingSteers = [];
+      return;
+    }
+    if (this.#scenario === "steer-rejected") {
+      this.#output({
+        id: command.id,
+        type: "response",
+        command: "steer",
+        success: false,
+        error: "Extension commands cannot be queued",
+      });
+      return;
+    }
+    this.#respond(command, { disposition: "queued" });
+    this.#output({
+      type: "tool_execution_end",
+      toolCallId: "steer-tool",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "done" }] },
+      isError: false,
+    });
+    if (this.#scenario === "steer-stranded") {
+      this.#pendingSteers.push(String(command.message));
+      this.#settleAgent();
+      return;
+    }
+    this.#answerSteer(String(command.message));
+  }
+
+  #answerSteer(text: string): void {
+    const user = { role: "user", content: [{ type: "text", text }] };
+    this.#output({ type: "message_start", message: user });
+    this.#output({ type: "message_end", message: user });
+    const message = { role: "assistant", content: [{ type: "text", text: `steered: ${text}` }] };
     this.#output({ type: "message_start", message });
     this.#output({ type: "message_end", message });
     this.#settleAgent();
@@ -1931,6 +2006,37 @@ describe("Pi RPC Turn aggregation", () => {
       ),
     );
     await rpc.close();
+  });
+
+  it.each(["steer", "steer-stranded"] as const)(
+    "steers a live run natively (%s)",
+    async (scenario) => {
+      const rpc = session(scenario);
+      await rpc.start();
+      expect(rpc.canSteer()).toBe(false);
+      const turn = rpc.runTurn("start", () => undefined);
+      await vi.waitFor(() => expect(rpc.canSteer()).toBe(true));
+      await rpc.steer("change course");
+      await expect(turn).resolves.toMatchObject({
+        text: expect.stringContaining("steered: change course"),
+        cancelled: false,
+      });
+      expect(rpc.canSteer()).toBe(false);
+      await rpc.close();
+    },
+  );
+
+  it("reports a steer Pi refused as rejected and keeps the run steerable", async () => {
+    const onFault = vi.fn();
+    const rpc = session("steer-rejected", onFault);
+    await rpc.start();
+    const turn = rpc.runTurn("start", () => undefined).catch(() => undefined);
+    await vi.waitFor(() => expect(rpc.canSteer()).toBe(true));
+    await expect(rpc.steer("/extension-command")).rejects.toBeInstanceOf(PiRpcCommandRejectedError);
+    expect(rpc.canSteer()).toBe(true);
+    expect(onFault).not.toHaveBeenCalled();
+    await rpc.close();
+    await turn;
   });
 
   it("assembles frames split across many stdout chunks", async () => {
