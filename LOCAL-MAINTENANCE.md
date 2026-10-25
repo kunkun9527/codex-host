@@ -21,6 +21,7 @@
 | `6cbd41f4`、`84f14d52` | Composer 里的工具问答卡（`request_user_input`）不被当成发送按钮 | renderer |
 | `36f4abc1` | 运行中原生 `steer` 同轮插入；大 JSONL 帧线性缓冲；超时命令的迟到回复不再让 Session 故障 | Pi 插件 |
 | `f768822b` | Pi 检测结果跨 Host 运行持久缓存，启动时不起 Pi 进程，30 秒后重检 | Pi 插件 |
+| `ddc194c3` | 打开会话时第一次读历史复用打开时读到的那份，只用 `since` 取增量 | Pi 插件 |
 
 每个提交的设计说明在提交信息和 `docs/harnesses/pi/`（`pi-steer.md`、`pi-inspection-cache.md` 等）。
 
