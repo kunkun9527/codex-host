@@ -584,8 +584,8 @@ export class PiRpcSession {
     this.#subagents.setHandler(handler);
   }
 
-  inspectSubagent(id: string): Promise<PiSubagentInspection> {
-    return this.#subagents.inspect(id);
+  inspectSubagent(id: string, queryChildId?: string): Promise<PiSubagentInspection> {
+    return this.#subagents.inspect(id, queryChildId);
   }
 
   setUsageHandler(handler: (observation: PiUsageObservation) => void): void {

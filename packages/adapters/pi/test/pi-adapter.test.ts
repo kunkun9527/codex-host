@@ -74,7 +74,9 @@ class FakePiTransport implements PiTurnTransport {
   readonly setSubagentStatusHandler = vi.fn((handler: (runs: PiSubagentNode[]) => void) => {
     this.subagentHandler = handler;
   });
-  readonly inspectSubagent = vi.fn(async (): Promise<PiSubagentInspection> => ({
+  readonly inspectSubagent = vi.fn<
+    (id: string, queryChildId?: string) => Promise<PiSubagentInspection>
+  >(async () => ({
     kind: "pi-subagents.inspect-reply",
     version: 1,
     requestId: "request",
@@ -644,6 +646,62 @@ describe("Pi HarnessAdapter Session", () => {
     ).toMatchObject({ ok: false });
     expect(transports[0]?.inspectSubagent).toHaveBeenCalledTimes(1);
     await adapter.close();
+  });
+
+  it("reads a running single run's transcript through its sole step, never a chain's", async () => {
+    for (const mode of ["single", "chain"]) {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      await session.readSnapshot();
+      const transport = transports[0];
+      if (!transport) throw new Error("Missing transport");
+      transport.history.entries.push({
+        id: "launch",
+        parentId: transport.history.leafId,
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          toolCallId: "call",
+          isError: false,
+          details: { mode, asyncId: "run-1", asyncDir: "/tmp/run-1", results: [] },
+        },
+      });
+      transport.history.leafId = "launch";
+      transport.inspectSubagent.mockImplementation(async (_id, queryChildId) => ({
+        kind: "pi-subagents.inspect-reply",
+        version: 1,
+        requestId: "request",
+        asyncId: "run-1",
+        status: "running",
+        ...(queryChildId
+          ? {
+              childId: queryChildId,
+              messages: [{ role: "assistant", kind: "text", text: "step progress" }],
+            }
+          : {}),
+      }));
+      const nativeSubagentId = piSubagentId({ runId: "run-1" });
+      const result = await adapter.subagents.readSnapshot({
+        parent: nativeSessionRefSchema.parse({
+          harnessId: "pi",
+          nativeSessionId: "pi-session-1",
+          formatVersion: 1,
+          locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+        }),
+        nativeSubagentId,
+        cwd: "/synthetic",
+      });
+      expect(result).toMatchObject({ ok: true });
+      if (mode === "single") {
+        expect(JSON.stringify(result)).toContain("step progress");
+        expect(transport.inspectSubagent).toHaveBeenLastCalledWith(nativeSubagentId, "step:0");
+      } else {
+        expect(JSON.stringify(result)).not.toContain("step progress");
+        expect(transport.inspectSubagent).toHaveBeenCalledTimes(1);
+      }
+      await adapter.close();
+    }
   });
 
   it("reports a missing executable as not installed", async () => {

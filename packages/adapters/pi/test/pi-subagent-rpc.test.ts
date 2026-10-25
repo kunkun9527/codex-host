@@ -63,6 +63,29 @@ describe("Pi subagent RPC side channel", () => {
     }
   });
 
+  it("queries a node under a root identity and requires the reply to echo it", async () => {
+    for (const echoed of ["step:0", undefined]) {
+      const send = vi.fn(async (type: string, payload: Record<string, unknown>) => {
+        if (type === "get_commands") return commands;
+        const requestId = String(payload.message).split(" ")[1] ?? "";
+        rpc.handle(reply(requestId, echoed ? { childId: echoed } : {}));
+        return {};
+      });
+      const rpc = new PiSubagentRpc(send, 100);
+      const pending = rpc.inspect(piSubagentId({ runId: "run-1" }), "step:0");
+      if (echoed) expect(await pending).toMatchObject({ childId: "step:0" });
+      else await expect(pending).rejects.toThrow("identity");
+      expect(send).toHaveBeenLastCalledWith("prompt", {
+        message: expect.stringMatching(/^\/subagents-inspect-rpc [\w-]+ run-1 step:0 --lines 200$/),
+      });
+      rpc.close();
+    }
+    const rpc = new PiSubagentRpc(async () => commands, 100);
+    await expect(
+      rpc.inspect(piSubagentId({ runId: "run-1", childId: "review" }), "step:0"),
+    ).rejects.toThrow("root identity");
+  });
+
   it("rejects mismatched identities and propagates session-scoped native errors", async () => {
     for (const extra of [
       { asyncId: "wrong-run" },
