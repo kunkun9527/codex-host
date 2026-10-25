@@ -968,6 +968,58 @@ describe("Pi HarnessAdapter Session", () => {
     await adapter.close();
   });
 
+  it("serves an earlier Host run's inspection at startup and revalidates it later", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-inspection-cache-"));
+    const inspectionCacheFile = path.join(directory, "cache", "pi-inspection-v1.json");
+    try {
+      const earlier = fixture({ inspectionCacheFile });
+      const inspected = await earlier.adapter.inspect({ cwd: "/synthetic" });
+      expect(inspected).toMatchObject({ status: "ready" });
+      await earlier.adapter.close();
+
+      const later = fixture({ inspectionCacheFile, inspectionRevalidateDelayMs: 10 });
+      const [served, concurrent] = await Promise.all([
+        later.adapter.inspect({ cwd: "/synthetic" }),
+        later.adapter.inspect({ cwd: "/synthetic" }),
+      ]);
+      expect(served).toEqual(inspected);
+      expect(concurrent).toEqual(inspected);
+      expect(later.dependencies.createTransport).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(later.transports[0]?.close).toHaveBeenCalledOnce());
+      expect(later.dependencies.createTransport).toHaveBeenCalledOnce();
+
+      // A failed refresh drops the persisted entry so the next run inspects Pi again.
+      vi.mocked(later.dependencies.createTransport).mockImplementationOnce((options) => {
+        const transport = new FakePiTransport();
+        transport.options = options;
+        transport.start.mockRejectedValueOnce(new Error("synthetic startup failure"));
+        return transport;
+      });
+      await expect(
+        later.adapter.inspect({ cwd: "/synthetic", refresh: true }),
+      ).resolves.toMatchObject({ status: "error" });
+      await later.adapter.close();
+
+      const next = fixture({ inspectionCacheFile });
+      await expect(next.adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+        status: "ready",
+      });
+      expect(next.dependencies.createTransport).toHaveBeenCalledOnce();
+      await next.adapter.close();
+
+      // An unreadable cache is empty, never a failed inspection.
+      await writeFile(inspectionCacheFile, "{not json");
+      const corrupt = fixture({ inspectionCacheFile });
+      await expect(corrupt.adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+        status: "ready",
+      });
+      expect(corrupt.dependencies.createTransport).toHaveBeenCalledOnce();
+      await corrupt.adapter.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("falls back inspect cwd when Host omits cwd or supplies the filesystem root", async () => {
     const { adapter, dependencies } = fixture();
     const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/");
