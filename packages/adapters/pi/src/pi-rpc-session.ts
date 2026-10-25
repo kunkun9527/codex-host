@@ -159,6 +159,25 @@ export class PiRpcUnsupportedCommandError extends Error {
   }
 }
 
+/** Pi answered the command with `success: false`, so it took no effect. */
+export class PiRpcCommandRejectedError extends Error {
+  constructor(
+    readonly command: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "PiRpcCommandRejectedError";
+  }
+}
+
+/** The steer was not written: no requested Pi run is live to take it. */
+export class PiSteerNotTakenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PiSteerNotTakenError";
+  }
+}
+
 export interface PiRpcSessionOptions {
   cwd: string;
   command?: string;
@@ -249,6 +268,8 @@ interface ActiveTurn {
   cancellation: "none" | "requesting" | "accepted";
   cancellationTimeout: NodeJS.Timeout | null;
   abortPromise: Promise<void> | null;
+  /** Pi took steering input for this run. */
+  steered: boolean;
 }
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -300,6 +321,12 @@ function parseSessionState(response: Record<string, unknown>): PiSessionState {
     thinkingLevel: thinkingLevel?.data ?? null,
     contextUsage: optionalPiStateContextUsage(data.contextUsage),
   };
+}
+
+/** Queued steering and follow-up input; absent on Pi builds without the field. */
+function pendingMessageCount(response: Record<string, unknown>): number {
+  const count = sessionStateData(response).pendingMessageCount;
+  return typeof count === "number" ? count : 0;
 }
 
 function parseSessionStreaming(response: Record<string, unknown>): boolean {
@@ -651,6 +678,36 @@ export class PiRpcSession {
     return this.#activeTurn !== null;
   }
 
+  /**
+   * Whether Pi steering now joins the requested Turn. Pi polls its steering queue after every
+   * assistant response and runs again for queued input before `agent_settled`, so input taken
+   * while the run is live stays in this Turn. A handled prompt never starts a run (no activity).
+   */
+  canSteer(): boolean {
+    const active = this.#activeTurn;
+    return (
+      active !== null &&
+      !this.#closed &&
+      !this.#failed &&
+      active.origin === "requested" &&
+      active.activity > 0 &&
+      active.settlement === "pending" &&
+      active.cancellation === "none"
+    );
+  }
+
+  /** Queues `text` with Pi's native `steer`; resolves once Pi took it. */
+  async steer(text: string): Promise<void> {
+    const active = this.#activeTurn;
+    if (!active || !this.canSteer()) {
+      throw new PiSteerNotTakenError("Pi has no live requested run to steer");
+    }
+    if (text.length === 0) throw new Error("Pi steer text must not be empty");
+    // Before the write: Pi's answer, agent_settled and the settle check can arrive in one chunk.
+    active.steered = true;
+    await this.#send("steer", { message: text });
+  }
+
   async start(): Promise<this> {
     if (this.#child || this.#closed) throw new Error("Pi RPC Session cannot be started twice");
     const fastExtension =
@@ -950,6 +1007,7 @@ export class PiRpcSession {
         cancellation: "none",
         cancellationTimeout: null,
         abortPromise: null,
+        steered: false,
       };
     });
     try {
@@ -1362,6 +1420,7 @@ export class PiRpcSession {
       cancellation: "none",
       cancellationTimeout: null,
       abortPromise: null,
+      steered: false,
     };
     this.#activeTurn = active;
     // Announce the autonomous Turn now; the Host attaches a live sink when it is free.
@@ -1534,7 +1593,7 @@ export class PiRpcSession {
       if (value.command === pending.command && error === `Unknown command: ${pending.command}`) {
         pending.reject(new PiRpcUnsupportedCommandError(pending.command));
       } else {
-        pending.reject(new Error(error));
+        pending.reject(new PiRpcCommandRejectedError(pending.command, error));
       }
     }
   }
@@ -1606,6 +1665,20 @@ export class PiRpcSession {
         if (this.#activeTurn !== active) return;
         // Work started from agent_settled (deferred prompt, extension wake) continues this Turn.
         let stable = !parseSessionStreaming(response) && active.activity === activity;
+        if (stable && active.steered && pendingMessageCount(response) > 0) {
+          // A steer taken just after Pi's last queue poll waits for the next prompt. Deliver it
+          // in this Turn, where the Host already shows it, unless the Turn was cancelled.
+          const resent = await this.#resendStrandedQueue(active);
+          if (this.#activeTurn !== active) return;
+          if (resent) {
+            // The resent run may have settled already, while this confirmation was running.
+            if (active.settleSignals === signals) {
+              active.settlement = "pending";
+              return;
+            }
+            continue;
+          }
+        }
         if (stable) {
           // Snapshot history while this Turn still owns the transport, so a following autonomous
           // run cannot leak its User Entry into this Turn's checkpoint, and an autonomous Turn
@@ -1643,6 +1716,22 @@ export class PiRpcSession {
             );
       this.#fail(fault);
     }
+  }
+
+  /** Drains Pi's queue; restarts this Turn's run with it unless cancelled. True when restarted. */
+  async #resendStrandedQueue(active: ActiveTurn): Promise<boolean> {
+    const cleared = await this.#send("clear_queue", {});
+    if (this.#activeTurn !== active || active.cancellation !== "none") return false;
+    const data = isRecord(cleared.data) ? cleared.data : {};
+    const texts = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((text): text is string => typeof text === "string") : [];
+    const steering = texts(data.steering);
+    const followUp = texts(data.followUp);
+    const [first, ...rest] = steering.length > 0 ? [steering.join("\n\n"), ...followUp] : followUp;
+    if (first === undefined) return false;
+    await this.#send("prompt", { message: first });
+    for (const text of rest) await this.#send("follow_up", { message: text });
+    return true;
   }
 
   #finishSettledTurn(active: ActiveTurn): void {

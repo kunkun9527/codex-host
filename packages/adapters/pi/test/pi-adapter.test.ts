@@ -37,6 +37,7 @@ import type { PiUsageObservation } from "../src/pi-usage.js";
 import { encodePiModelRef } from "../src/pi-model-catalog.js";
 import type { PiNativeCommand } from "../src/pi-slash-commands.js";
 import {
+  PiRpcCommandRejectedError,
   PiRpcFaultError,
   type PiAutonomousTurn,
   type PiAutonomousTurnCompletion,
@@ -85,6 +86,11 @@ class FakePiTransport implements PiTurnTransport {
     finalOutput: "child answer",
   }));
   readonly abort = vi.fn(async () => undefined);
+  steerable = false;
+  readonly canSteer = vi.fn(() => this.steerable);
+  readonly steer = vi.fn(async (text: string) => {
+    void text;
+  });
   readonly respondToInteraction = vi.fn(async (response: PiInteractionResponse) => {
     this.event({
       type: "interaction.closed",
@@ -407,6 +413,14 @@ function textTurn(id: string) {
     type: "turn.start" as const,
     turnId: hostTurnIdSchema.parse(id),
     input: [{ type: "text" as const, text: id }],
+  };
+}
+
+function steerTurn(id: string, text: string) {
+  return {
+    type: "turn.steer" as const,
+    turnId: hostTurnIdSchema.parse(id),
+    input: [{ type: "text" as const, text }],
   };
 }
 
@@ -3446,6 +3460,44 @@ describe("Pi HarnessAdapter Session", () => {
     transports[0]?.succeed("");
     await nextEvent(iterator);
     await nextEvent(iterator);
+    await session.close();
+  });
+
+  it("steers the active Turn through Pi's native steer only while its run is live", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    await session.execute(textTurn("steered"));
+    const transport = transports[0] as FakePiTransport;
+    expect(session.capabilities.steer).toBe(false);
+    await expect(session.execute(steerTurn("steered", "early"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState" },
+    });
+    expect(transport.steer).not.toHaveBeenCalled();
+
+    transport.steerable = true;
+    expect(session.capabilities.steer).toBe(true);
+    await expect(session.execute(steerTurn("other", "wrong Turn"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState" },
+    });
+    await expect(session.execute(steerTurn("steered", "change course"))).resolves.toEqual({
+      ok: true,
+      value: { accepted: true },
+    });
+    expect(transport.steer).toHaveBeenCalledExactlyOnceWith("change course");
+
+    transport.steer.mockRejectedValueOnce(
+      new PiRpcCommandRejectedError("steer", "Extension commands cannot be queued"),
+    );
+    await expect(session.execute(steerTurn("steered", "/command"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState", message: "Extension commands cannot be queued" },
+    });
+
+    await session.execute(cancelTurn("steered"));
+    expect(session.capabilities.steer).toBe(false);
+    transport.succeed("stopped", true);
     await session.close();
   });
 
