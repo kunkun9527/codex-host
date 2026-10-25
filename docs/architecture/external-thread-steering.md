@@ -5,7 +5,7 @@ codexhost 对外部 Harness Thread 保留一个「调整方向」操作，按当
 - **原生同轮插入**：Session 此刻声明 `capabilities.steer` 时，Host 发送公共命令 `turn.steer`，由 Adapter 调用 Harness 自己的插入原语，在原生安全边界把输入送入**当前 Turn**，不取消、不另起 Turn。
 - **停止后重发（退路）**：其余情况下，Host **取消当前 Turn，等待它终结，再自动执行本次新输入**。任何不确定能并入当前 Turn 的情况都走这条路径，保证不比没有原生插入时差。
 
-用户继续使用 Codex Desktop 原有按钮、跟进处理方式设置和单条消息反向操作，不需要手动停止后重发。官方 Codex Thread 仍透传原生 `turn/steer`，不改变同轮追加输入的语义。当前只有 Claude Code 会声明 `capabilities.steer`，并且只在确定插入会并入当前 Turn 时声明；其条件与原生依据见 [`../harnesses/claude-code/claude-code-steer.md`](../harnesses/claude-code/claude-code-steer.md)；其他 Adapter 对 `turn.steer` 返回 `unsupported`，保持停止后重发。
+用户继续使用 Codex Desktop 原有按钮、跟进处理方式设置和单条消息反向操作，不需要手动停止后重发。官方 Codex Thread 仍透传原生 `turn/steer`，不改变同轮追加输入的语义。当前 Claude Code 与 Pi 会声明 `capabilities.steer`，并且只在确定插入会并入当前 Turn 时声明；其条件与原生依据见 [`../harnesses/claude-code/claude-code-steer.md`](../harnesses/claude-code/claude-code-steer.md) 和 [`../harnesses/pi/pi-steer.md`](../harnesses/pi/pi-steer.md)；其他 Adapter 对 `turn.steer` 返回 `unsupported`，保持停止后重发。
 
 ## 原生同轮插入
 
@@ -107,6 +107,7 @@ Codex Desktop **26.924.22138 / build 11645** 的本地队列在 `turnCompleted` 
 - `packages/renderer-extension/test/renderer-external-steering.test.ts`（`steer delivery handshake`）：inspect 带文本、两种展示方式分别标记 `codexhostSteerDelivery`、Host 不支持 inspect 时改用 Thread 所有权。
 - `packages/protocol-core/test/codex-ui-projector.test.ts`：插入的 `userMessage` 在实时与历史投影中留在所属 Turn。
 - `packages/adapters/claude-code/test/*.test.ts`：Claude Code 的 `priority: "next"` 推入、接受条件、错过 Turn 与历史分轮。
+- `packages/adapters/pi/test/pi-rpc-session.test.ts`、`pi-adapter.test.ts`：Pi 的 RPC `steer`、接受条件、错过最后一次队列检查后的同轮补发与拒绝映射。
 - `packages/host-runtime/test/external-turn-steering.test.ts`：原生插入不取消、失败释放回执、没收下时退回（当前 Turn 已结束则直接启动下一个、正在结束则等待其终态），以及延迟/同步终态、去重、冲突、过期目标、输入预检、超时迟到、fault、关闭、显式停止、自主 Turn 及启动失败。
 - `packages/host-runtime/test/app-server-host*.test.ts`：真实 Host 路由、外部不泄漏官方流、取消与启动顺序、响应 gate、同 Thread start 竞争、官方透传。
 - `packages/renderer-extension/test/renderer-external-steering.test.ts`：正常 start 占位、唯一输入、无旧轮 steer Item、去重、队列暂停恢复、owner/follower、失败和卸载。

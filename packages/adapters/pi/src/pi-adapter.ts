@@ -7,7 +7,6 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import {
-  unsupportedSteer,
   HarnessOutputChannel,
   validateHostQuestionResponse,
   type HarnessAdapter,
@@ -100,9 +99,11 @@ import { rollbackPiLastTurn } from "./pi-last-turn-rollback.js";
 import { PiSessionImportIndex } from "./pi-session-import.js";
 import { SessionImportScope } from "@codexhost/harness-adapter/session-import";
 import {
+  PiRpcCommandRejectedError,
   PiRpcFaultError,
   PiRpcSession,
   PiRpcUnsupportedCommandError,
+  PiSteerNotTakenError,
   type PiInteractionRequest,
   type PiInteractionResponse,
   type PiRpcSessionOptions,
@@ -149,6 +150,9 @@ export interface PiTurnTransport {
   setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => PiAutonomousTurnHost | null): void;
   /** Finished assistant messages, for Host usage metering; absent on transports without it. */
   setUsageHandler?(handler: (observation: PiUsageObservation) => void): void;
+  /** Whether native steering now joins the requested Turn; absent on transports without it. */
+  canSteer?(): boolean;
+  steer?(text: string): Promise<void>;
   start(): Promise<unknown>;
   getAvailableModels(): Promise<PiNativeModel[]>;
   getAvailableThinkingLevels(): Promise<HarnessThinkingOptionId[] | null>;
@@ -526,7 +530,12 @@ class PiHarnessSession implements HarnessSession {
     this.#requestedThinkingOptionId = options.thinkingOptionId;
     this.#toolOutputLimit = options.toolOutputLimit;
     this.#isFastSupported = options.isFastSupported;
+    const canSteer = (): boolean => this.#canSteer();
     this.capabilities = {
+      // Read live: Pi's steer joins this Turn only while its requested run is live.
+      get steer(): boolean {
+        return canSteer();
+      },
       configuration: {
         selectModel: true,
         selectThinkingOption: options.supportsThinkingSelection,
@@ -657,7 +666,7 @@ class PiHarnessSession implements HarnessSession {
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Pi Session is not open") };
     }
-    if (command.type === "turn.steer") return unsupportedSteer("Pi");
+    if (command.type === "turn.steer") return this.#steer(command);
     if (command.type === "turn.cancel") return this.#cancel(command);
     if (command.type === "interaction.respond") return this.#respond(command);
     if (command.type === "model.select") return this.#selectModel(command);
@@ -1003,6 +1012,47 @@ class PiHarnessSession implements HarnessSession {
     } finally {
       this.#configuring = false;
     }
+  }
+
+  #canSteer(): boolean {
+    return (
+      this.#phase === "open" &&
+      this.#active !== null &&
+      !this.#active.cancellationRequested &&
+      this.#transport?.canSteer?.() === true
+    );
+  }
+
+  async #steer(command: TurnSteerCommand): Promise<HarnessResult<TurnSteerAccepted>> {
+    const active = this.#active;
+    if (!active || active.command.turnId !== command.turnId) {
+      return { ok: false, error: invalidState("Pi steer target is not the active Turn") };
+    }
+    const text = command.input.map((input) => input.text).join("\n");
+    if (text.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi steer text must not be empty",
+          retryable: false,
+        },
+      };
+    }
+    const transport = this.#transport;
+    if (!transport?.steer || !this.#canSteer()) {
+      return { ok: false, error: invalidState("Pi steer missed the live run") };
+    }
+    try {
+      await transport.steer(text);
+    } catch (error) {
+      // Refused before or by Pi: nothing was queued, so the Host may stop and restart instead.
+      if (error instanceof PiSteerNotTakenError || error instanceof PiRpcCommandRejectedError) {
+        return { ok: false, error: invalidState(error.message) };
+      }
+      throw error;
+    }
+    return { ok: true, value: { accepted: true } };
   }
 
   async #cancel(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>> {
