@@ -59,8 +59,15 @@ export class PiSubagentRpc {
     return true;
   }
 
-  async inspect(nativeSubagentId: string): Promise<PiSubagentInspection> {
-    const address = parsePiSubagentId(nativeSubagentId);
+  /**
+   * `queryChildId` addresses a node under a root identity (a single run's `step:0`) without
+   * changing the UI identity; the reply must echo it.
+   */
+  async inspect(nativeSubagentId: string, queryChildId?: string): Promise<PiSubagentInspection> {
+    const parsed = parsePiSubagentId(nativeSubagentId);
+    if (queryChildId !== undefined && parsed.childId !== undefined)
+      throw new Error("Pi subagent query child requires a root identity");
+    const address = queryChildId === undefined ? parsed : { ...parsed, childId: queryChildId };
     const commands = await this.send("get_commands", {});
     const data = commands.data as { commands?: { name?: string; source?: string }[] } | undefined;
     if (
