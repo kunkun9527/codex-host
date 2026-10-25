@@ -17,7 +17,9 @@ Adapter 优先复用正在运行的父 Pi RPC Session；父 Session 不在内存
 
 **同步 workflow**：从父会话当前分支的原生工具结果定位对应 workflow/child，读取该结果引用的 Pi v3 子 Session 文件（最多 8 MiB，只读，不启动子模型或子进程）。子记录的 Turn 引用绑定父 Native Session 并带子任务命名空间，且不提供可写 checkpoint。文件已清理、超限或不支持时，若父结果保留 `finalOutput`，则明确标注为原生结果摘要，而非完整会话；没有记录时返回可重试错误。UI 提供的 child ID 不包含文件路径。
 
-**异步任务**：读取先通过 `get_commands` 确认 `subagents-inspect-rpc` 是原生扩展命令，再发送 `/subagents-inspect-rpc <requestId> <runId> [childId] --lines 200`。缺少命令时不发送普通 Prompt，避免误触模型。响应来自 `subagent-inspect` 的 `PI_SUBAGENT_INSPECT_JSON:`，必须是 v1、匹配请求和目标身份。忽略无对应请求、撤回、损坏和未知版本的帧；超时和关闭会结束等待。
+**异步 single 任务**：优先读子代理自己的 Pi v3 Session 文件，与同步 workflow 共用同一套投影，所以任务文本作为输入、工具调用作为工具项显示。文件路径只从父会话当前分支的原生启动回执（`asyncDir`）找到 `status.json`，校验版本 3、`runId`、`mode: single` 及父 Session 归属，再取 `steps[0].sessionFile`（没有时用根 `sessionFile`）；路径必须位于父 Session 文件同名目录（去掉 `.jsonl`）之下，否则拒读。运行中的子 Session 末尾若有未写完的行，先忽略。文件缺失、超过 8 MiB、不支持或越界时，退回下面的检查接口。
+
+**异步任务（检查接口）**：读取先通过 `get_commands` 确认 `subagents-inspect-rpc` 是原生扩展命令，再发送 `/subagents-inspect-rpc <requestId> <runId> [childId] --lines 200`。缺少命令时不发送普通 Prompt，避免误触模型。响应来自 `subagent-inspect` 的 `PI_SUBAGENT_INSPECT_JSON:`，必须是 v1、匹配请求和目标身份。忽略无对应请求、撤回、损坏和未知版本的帧；超时和关闭会结束等待。
 
 此接口提供的是**原生有界转写窗口**，不是完整可续写 Session：最多 200 条消息和 64 KiB；保留原生截断提示。原生未提供任务文本时不猜测（例如 fork 上下文）。工具转写以带角色/工具名的文本展示，不捏造缺失的工具参数。`foreign_session`、`not_found`、`stale` 等原生错误不会降级成空的成功快照。
 
