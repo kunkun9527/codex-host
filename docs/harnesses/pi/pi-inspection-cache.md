@@ -7,7 +7,7 @@ Pi 的 `inspect()` 要起一个完整的 Pi RPC 进程（加载全部 Pi 扩展�
 - 检测成功（`status: "ready"`）的结果按 inspect cwd 写入 `<CODEXHOST_DATA_DIR 或 ~/.codexhost>/cache/pi-inspection-v1.json`（`plugin.ts` 传入 `inspectionCacheFile`）。
 - 内存里没有、文件里有时，直接返回文件里的结果，不起 Pi 进程；同时安排一次延迟重检（默认 30 秒，`inspectionRevalidateDelayMs`），避开启动高峰。重检成功覆盖内存和文件。
 - 重检或任何一次检测失败时删掉文件里的该 cwd 条目，下次 Host 启动重新真实检测；本次运行的内存缓存沿用原有语义（失败不清掉已有的成功结果）。
-- `refresh: true`（设置页「重新检测」）绕过文件缓存。凭据导入、重导入、移除同时清空内存和文件缓存，并让变更前已开始的检测作废：它们的结果既不写回缓存，也不再被新请求复用。
+- `refresh: true`（设置页「重新检测」）绕过文件缓存。凭据导入、重导入、移除同时清空内存和文件缓存，并让变更前已开始的检测作废：它们的结果既不写回缓存，也不再被新请求复用；变更前开始读取的持久条目同样丢弃。
 - 文件缺失、损坏或条目不通过 `harnessInspectionSchema` 校验时按空缓存处理，不报错。
 - 不传 `inspectionCacheFile`（测试、直接构造 Adapter）时只用内存缓存，行为与以前相同。
 
