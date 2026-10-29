@@ -5,26 +5,28 @@
 ## 布局
 
 - 仓库：`C:/Users/Su/src/codex-host-pi-local`。`origin` 是上游 `BytePioneer-AI/codex-host`，`fork` 是 `kunkun9527/codex-host`。
-- 当前分支：`pi-local-0.15.0`，基于上游 tag `v0.15.0`，跟踪 `fork/pi-local-0.15.0`（旧分支 `pi-local-0.14.0` 保留）。本地修改都是这条分支上 `v0.15.0..HEAD` 的提交，git 提交本身就是补丁，不另存 patch 文件。
+- 当前分支：`pi-local-0.16.0`，基于上游 tag `v0.16.0`，跟踪 `fork/pi-local-0.16.0`（旧分支 `pi-local-0.15.0`、`pi-local-0.14.0` 保留）。本地修改都是这条分支上 `v0.16.0..HEAD` 的提交，git 提交本身就是补丁，不另存 patch 文件。
 - 安装目录：`%LOCALAPPDATA%/Programs/codexhost/app/`，版本看其中 `codexhost-distribution.json` 的 `version`。
 
 ## 本地提交
 
-用 `git log --oneline v<版本>..HEAD` 查看。截至 v0.15.0（括号里是 `pi-local-0.14.0` 上的原提交）：
+用 `git log --oneline v<版本>..HEAD` 查看。截至 v0.16.0（括号里是 `pi-local-0.15.0` 上的原提交）：
 
 | 提交 | 内容 | 部署到 |
 |---|---|---|
-| `edec99d7`（`78a62a3e`） | 取消手动压缩时不再让 Session 故障 | Pi 插件 |
-| `c8d39c71`（`4019a274`） | 子代理卡片在回执先于快照时也显示；恢复会话文件拥有的卡片 | Pi 插件 |
-| `3a9d39b3`（`6232df9e`） | 自主回合实时显示、handled prompt、回合跨不稳定 settle 保持打开 | Pi 插件 |
-| `a7c5b369`（`acbd67e5`） | 运行中 single 子代理按唯一 step 读取 | Pi 插件 |
-| `13e1befd`（`36f4abc1`） | 运行中原生 `steer` 同轮插入 | Pi 插件 |
-| `d2520123`（`f768822b`） | Pi 检测结果跨 Host 运行持久缓存，启动时不起 Pi 进程，30 秒后重检 | Pi 插件 |
-| `fc668da9`（`ddc194c3`） | 打开会话时第一次读历史复用打开时读到的那份，只用 `since` 取增量 | Pi 插件 |
-| `6cb2185e`（`daf5ce9b`） | 凭据变更前已开始的检测作废，不写回缓存 | Pi 插件 |
-| `39039149`（`667763e2`） | 异步 single 子代理卡片读子代理自己的 Session 文件：显示任务和工具项，不再是纯文本窗口 | Pi 插件 |
-| `e75acab3`（`f388f5ac`） | 跨凭据变更读到的持久检测条目也丢弃 | Pi 插件 |
-| `e46ee876`（`b940f431`） | 子 Session 路径解析链接后再判断是否在父目录内 | Pi 插件 |
+| `8670cdbe`（`edec99d7`） | 取消手动压缩时不再让 Session 故障 | Pi 插件 |
+| `f0088e2b`（`c8d39c71`） | 子代理卡片在回执先于快照时也显示；恢复会话文件拥有的卡片 | Pi 插件 |
+| `25b2804a`（`3a9d39b3`） | 自主回合实时显示、handled prompt、回合跨不稳定 settle 保持打开 | Pi 插件 |
+| `21a8362c`（`a7c5b369`） | 运行中 single 子代理按唯一 step 读取 | Pi 插件 |
+| `08cfc0e6`（`13e1befd`） | 运行中原生 `steer` 同轮插入 | Pi 插件 |
+| `f435fc81`（`d2520123`） | Pi 检测结果跨 Host 运行持久缓存，启动时不起 Pi 进程，30 秒后重检 | Pi 插件 |
+| `4476160b`（`fc668da9`） | 打开会话时第一次读历史复用打开时读到的那份，只用 `since` 取增量 | Pi 插件 |
+| `49d2ec03`（`6cb2185e`） | 凭据变更前已开始的检测作废，不写回缓存 | Pi 插件 |
+| `073c62de`（`39039149`） | 异步 single 子代理卡片读子代理自己的 Session 文件：显示任务和工具项，不再是纯文本窗口 | Pi 插件 |
+| `41352d1c`（`e75acab3`） | 跨凭据变更读到的持久检测条目也丢弃 | Pi 插件 |
+| `cea50fee`（`e46ee876`） | 子 Session 路径解析链接后再判断是否在父目录内 | Pi 插件 |
+
+升级到 v0.16.0 时全部提交无冲突带上，没有跳过的；上游 #634 给 `PiSessionState` 加了 `modelReasoning`，与本地改动不重叠。
 
 升级到 v0.15.0 时上游已修、不再带的：
 
@@ -50,7 +52,7 @@
 
 ## 升级 codexhost 的步骤
 
-1. 用户先装好新版。读 `app/codexhost-distribution.json` 得到新版本 `<新>`。
+1. 装新版：用户在界面里更新，或由 Agent `gh release download v<新> -R BytePioneer-AI/codex-host -p 'codexhost-<新>-windows-x64.exe'` 后运行 `<安装程序> /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`（Inno Setup，会先关闭运行中的 codexhost）。读 `app/codexhost-distribution.json` 确认新版本 `<新>`。
 2. `git fetch origin --tags`，`git switch -c pi-local-<新> v<新>`。
 3. 按顺序 `git cherry-pick` 旧分支 `v<旧>..pi-local-<旧>` 的提交（含本文件的提交）。上游已修的问题跳过对应提交，冲突时以上游新代码为准重写本地修改，并更新上表。
 4. `npm ci`；跑 `npx vitest run packages/adapters/pi packages/renderer-extension`，再对改动文件跑 `npx eslint`、`npx prettier --check`、`npx tsc -b`。
